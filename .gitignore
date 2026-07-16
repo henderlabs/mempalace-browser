@@ -1,0 +1,25 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+
+# environments
+.venv/
+venv/
+env/
+
+# editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# local
+*.log
+_check.mjs
