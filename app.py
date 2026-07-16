@@ -20,6 +20,7 @@ Unofficial; not affiliated with the MemPalace project. MIT licensed.
 Styling follows the HenderLabs brand palette.
 """
 
+import html
 import http.server
 import json
 import os
@@ -281,21 +282,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             name = host.rsplit(":", 1)[0] if ":" in host else host
         return name in ALLOWED_HOSTS
 
-    def do_GET(self):
-        if not self._host_allowed():
-            host = self.headers.get("Host", "(none)")
-            sys.stderr.write(
-                f"  refused request for Host: {host!r} — not in MPB_ALLOWED_HOSTS.\n"
-                f"  If this is you, add it:  MPB_ALLOWED_HOSTS={host.rsplit(':',1)[0]} ./run.sh\n"
-            )
+    def _refuse_host(self, path):
+        """Explain the refusal in the medium the caller is actually using."""
+        host = self.headers.get("Host", "(none)")
+        name = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
+        sys.stderr.write(
+            f"  refused request for Host: {host!r} — not in MPB_ALLOWED_HOSTS.\n"
+            f"  If this is you, add it:  MPB_ALLOWED_HOSTS={name} ./run.sh\n"
+        )
+        if path.startswith("/api/"):
             self._send(403, json.dumps({
                 "error": "host not allowed",
                 "host": host,
-                "hint": "add it to MPB_ALLOWED_HOSTS if this is you",
+                "hint": f"restart with MPB_ALLOWED_HOSTS={name} if this is you",
             }), "application/json")
             return
+        # A person in a browser gets a page, not a JSON blob. Without this they
+        # see {"error":"host not allowed"} and reasonably conclude it is broken.
+        # The Host header is attacker-controlled, so escape it — reflecting it
+        # raw would be XSS in the very code path added to stop an attack.
+        # Deliberately does NOT print the allowed-host list. It is not
+        # exploitable — a rebinding attacker cannot forge Host, browsers set it
+        # — but it hands internal hostnames to any caller, and the actionable
+        # line is the command with their own name in it. The operator sees the
+        # full list in the terminal, where it belongs.
+        self._send(403, HOST_REFUSED_HTML
+                   .replace("{{HOST}}", html.escape(host))
+                   .replace("{{NAME}}", html.escape(name)),
+                   "text/html; charset=utf-8")
 
+    def do_GET(self):
         path, _, qs = self.path.partition("?")
+
+        # Host check first: nothing else should happen for a request we do not
+        # trust the origin of.
+        if not self._host_allowed():
+            self._refuse_host(path)
+            return
+
         # Parse properly: `?x=notrefresh=1` must NOT force a re-read.
         force = "1" in urllib.parse.parse_qs(qs).get("refresh", [])
         try:
@@ -328,6 +352,53 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+
+HOST_REFUSED_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemPalace Browser — host not allowed</title>
+<style>
+  :root { --brand:#0D6BFF; --bg:#050814; --surface:#080E1E; --fg:#FFFFFF;
+          --muted:#BFC7D1; --subtle:#6E7886; --warn:#F59E0B;
+          --line:rgb(191 199 209 / .18);
+          --mono:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  html { color-scheme:dark; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px;
+         background:var(--bg); color:var(--fg);
+         font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .card { max-width:620px; background:var(--surface); border:1px solid var(--line);
+          border-radius:10px; padding:26px 28px; }
+  .wm { font-size:1.125rem; font-weight:700; letter-spacing:-.02em; margin-bottom:18px; }
+  .wm span { color:var(--brand); }
+  h1 { font-size:15px; margin:0 0 12px; color:var(--warn); }
+  p { color:var(--muted); margin:0 0 12px; }
+  code, pre { font-family:var(--mono); }
+  code { background:#0D1526; padding:1px 5px; border-radius:3px; font-size:12.5px; }
+  pre { background:#0D1526; border:1px solid var(--line); border-radius:7px;
+        padding:11px 13px; overflow-x:auto; font-size:12.5px; margin:0 0 12px;
+        color:var(--fg); }
+  .why { border-top:1px solid var(--line); margin-top:18px; padding-top:14px;
+         font-size:12.5px; color:var(--subtle); }
+</style></head>
+<body><div class="card">
+  <div class="wm">MemPalace<span> Browser</span></div>
+  <h1>Host not allowed: {{HOST}}</h1>
+  <p>This is almost certainly a configuration step, not a bug. The browser only
+     answers requests whose <code>Host</code> it recognises, and this one is not
+     on the list. The full list is printed in the terminal where you started it.</p>
+  <p><strong>If this is you</strong>, restart it with your hostname allowed:</p>
+  <pre>MPB_ALLOWED_HOSTS={{NAME}} ./run.sh</pre>
+  <p>Or reach it over an SSH tunnel, which needs no configuration because your
+     browser still says <code>localhost</code>:</p>
+  <pre>ssh -L 8080:127.0.0.1:8080 you@this-host</pre>
+  <div class="why"><strong>Why this check exists.</strong> There is no password
+     here — on localhost, the operating system is the authentication. That only
+     holds if a browser cannot be tricked into treating this server as
+     same-origin. A malicious page can point its own domain at
+     <code>127.0.0.1</code> (DNS rebinding) and would otherwise read every
+     drawer in your palace. Checking the <code>Host</code> closes that.</div>
+</div></body></html>
+"""
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
