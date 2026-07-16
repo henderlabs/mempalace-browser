@@ -29,6 +29,7 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -39,6 +40,20 @@ from datetime import datetime, timezone
 # ones you did not think about. Change it deliberately, not by default.
 BIND = os.environ.get("MPB_BIND", "127.0.0.1")
 PORT = int(os.environ.get("MPB_PORT", "8080"))
+
+# DNS-rebinding defence. "No auth because it's localhost" only holds if the
+# browser cannot be tricked into treating us as same-origin. A malicious page
+# can point its own domain at 127.0.0.1, at which point the same-origin policy
+# protects nothing and it can read every drawer through /api/data. Checking the
+# Host header costs nothing and closes it: a rebound request arrives claiming
+# Host: evil.example, which is not in this set.
+_DEFAULT_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+ALLOWED_HOSTS = set(_DEFAULT_HOSTS)
+if BIND not in ("0.0.0.0", "::", ""):
+    ALLOWED_HOSTS.add(BIND.lower())
+for _h in os.environ.get("MPB_ALLOWED_HOSTS", "").split(","):
+    if _h.strip():
+        ALLOWED_HOSTS.add(_h.strip().lower())
 PYPI_TTL = 3600           # seconds to cache the PyPI lookup
 PALACE_TTL = 30           # seconds to cache the palace read
 PYPI_URL = "https://pypi.org/pypi/mempalace/json"
@@ -256,9 +271,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _host_allowed(self):
+        """Reject requests whose Host we do not recognise (DNS rebinding)."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        # Strip the port, being careful with bracketed IPv6 literals.
+        if host.startswith("["):
+            name = host.partition("]")[0].lstrip("[")
+        else:
+            name = host.rsplit(":", 1)[0] if ":" in host else host
+        return name in ALLOWED_HOSTS
+
     def do_GET(self):
+        if not self._host_allowed():
+            host = self.headers.get("Host", "(none)")
+            sys.stderr.write(
+                f"  refused request for Host: {host!r} — not in MPB_ALLOWED_HOSTS.\n"
+                f"  If this is you, add it:  MPB_ALLOWED_HOSTS={host.rsplit(':',1)[0]} ./run.sh\n"
+            )
+            self._send(403, json.dumps({
+                "error": "host not allowed",
+                "host": host,
+                "hint": "add it to MPB_ALLOWED_HOSTS if this is you",
+            }), "application/json")
+            return
+
         path, _, qs = self.path.partition("?")
-        force = "refresh=1" in qs
+        # Parse properly: `?x=notrefresh=1` must NOT force a re-read.
+        force = "1" in urllib.parse.parse_qs(qs).get("refresh", [])
         try:
             if path == "/":
                 self._send(200, INDEX_HTML, "text/html; charset=utf-8")
@@ -668,16 +707,22 @@ function renderChips(){
   chip.style.display = nu ? "" : "none";
   chip.textContent = nu + " new";
 
+  // Escape these too. They look trustworthy — one is our own package version,
+  // the other comes from PyPI over HTTPS — but "the input is probably fine" is
+  // not a security control, and esc() is free.
   const v = DATA.version, vc = document.getElementById("verChip");
+  const inst = esc(v.installed), late = esc(v.latest);
   if(v.status === "current"){
-    vc.className = "chip act current"; vc.innerHTML = `<b>${v.installed}</b> · up to date`;
+    vc.className = "chip act current"; vc.innerHTML = `<b>${inst}</b> · up to date`;
   } else if(v.status === "update-available"){
-    vc.className = "chip act update"; vc.innerHTML = `<b>${v.installed}</b> → ${v.latest} available`;
+    vc.className = "chip act update"; vc.innerHTML = `<b>${inst}</b> → ${late} available`;
   } else if(v.status === "ahead"){
-    vc.className = "chip act"; vc.innerHTML = `<b>${v.installed}</b> · ahead of PyPI (${v.latest})`;
+    vc.className = "chip act"; vc.innerHTML = `<b>${inst}</b> · ahead of PyPI (${late})`;
+  } else if(v.status === "checking"){
+    vc.className = "chip act"; vc.innerHTML = `<b>${inst}</b> · checking…`;
   } else {
     // PyPI unreachable. Say so — never imply "current".
-    vc.className = "chip act unknown"; vc.innerHTML = `<b>${v.installed}</b> · update check failed`;
+    vc.className = "chip act unknown"; vc.innerHTML = `<b>${inst}</b> · update check failed`;
     vc.title = v.error || "could not reach PyPI";
   }
 }
@@ -750,7 +795,12 @@ if __name__ == "__main__":
             "Refusing to start — this is what a wrong path looks like."
         )
 
-    v, s = version_info(), d["storage"]
+    # Warm the PyPI check in the background. The installed version is local and
+    # instant; only the comparison needs the network. Blocking the banner on it
+    # means an offline user waits out a timeout just to be told their URL.
+    threading.Thread(target=version_info, kwargs={"force": True}, daemon=True).start()
+
+    s = d["storage"]
     print("=" * 60)
     print("  MemPalace Browser")
     print("=" * 60)
@@ -764,8 +814,9 @@ if __name__ == "__main__":
               f"{', dedicated' if s['dedicated'] else ', SHARED WITH OS'})")
     else:
         print(f"  storage   : n/a — {s.get('reason')}")
-    print(f"  installed : {v['installed']}  (PyPI: {v['latest'] or 'unreachable'} → {v['status']})")
+    print(f"  installed : {MP_VERSION}  (checking PyPI in background)")
     print(f"  serving   : http://{BIND}:{PORT}/")
+    print(f"  hosts     : {', '.join(sorted(ALLOWED_HOSTS))}")
     if BIND != "127.0.0.1":
         print(f"  WARNING   : bound to {BIND} — your palace is readable by other")
         print("              machines on this network, with no authentication.")

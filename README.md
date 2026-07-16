@@ -46,6 +46,7 @@ Everything is optional. Defaults are chosen so that running it with no configura
 |----------|---------|--------------|
 | `MPB_BIND` | `127.0.0.1` | Interface to bind. **See [Security](#security) before changing this.** |
 | `MPB_PORT` | `8080` | Port to listen on |
+| `MPB_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Extra `Host` headers to accept, comma-separated. Needed if you reach it by a hostname — e.g. `MPB_ALLOWED_HOSTS=palace.lan` |
 | `MEMPALACE_PYTHON` | *(auto-detected)* | Interpreter to use, if auto-detection picks wrong |
 
 The palace itself is located by asking MemPalace, so `MEMPALACE_PALACE_PATH` and your
@@ -58,7 +59,8 @@ The palace itself is located by asking MemPalace, so `MEMPALACE_PALACE_PATH` and
 There is no authentication, because on localhost the operating system is the authentication. Bind
 it to `0.0.0.0` and every device on your network can read every drawer — including whatever your
 palace holds about your health, your work, your family, and your diary, and including the devices
-on your network you have not thought about lately.
+on your network you have not thought about lately. Web pages that *other* devices visit can reach
+it too, not just people sitting at a keyboard.
 
 If you need it from another machine, an SSH tunnel keeps the localhost default intact and needs no
 password:
@@ -68,6 +70,19 @@ ssh -L 8080:127.0.0.1:8080 you@your-palace-host
 ```
 
 Only use `MPB_BIND=0.0.0.0` on a network you would hand your unlocked laptop to.
+
+**`Host` header checking.** "Localhost is the authentication" is only true if a browser cannot be
+tricked into treating this server as same-origin. A malicious web page can point its own domain at
+`127.0.0.1` (DNS rebinding), and the same-origin policy then protects nothing — it could read your
+whole palace through `/api/data`. So requests are rejected unless their `Host` is one you have
+allowed. If you reach the browser by a hostname rather than an IP, add it:
+
+```bash
+MPB_ALLOWED_HOSTS=palace.lan ./run.sh
+```
+
+A rejected request logs the exact variable to set, so a 403 tells you what to do rather than
+leaving you guessing.
 
 ## Backends
 

@@ -17,9 +17,15 @@ set -euo pipefail
 APP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/app.py"
 
 find_python() {
-  # 1. Explicit override always wins.
+  # 1. Explicit override wins — but is still checked. If you typo the path, you
+  #    should hear it from here with the list of what was tried, not from a
+  #    confusing ImportError inside app.py.
   if [[ -n "${MEMPALACE_PYTHON:-}" ]]; then
-    echo "$MEMPALACE_PYTHON"; return
+    if [[ -x "$MEMPALACE_PYTHON" ]] && "$MEMPALACE_PYTHON" -c "import mempalace" 2>/dev/null; then
+      echo "$MEMPALACE_PYTHON"; return
+    fi
+    echo "MEMPALACE_PYTHON is set to '$MEMPALACE_PYTHON' but that cannot import mempalace." >&2
+    return 1
   fi
 
   # 2. The mempalace console script's shebang points at an interpreter that can
@@ -29,10 +35,24 @@ find_python() {
   if cli="$(command -v mempalace 2>/dev/null)"; then
     shebang="$(head -1 "$cli" 2>/dev/null || true)"
     if [[ "$shebang" == '#!'* ]]; then
-      local interp="${shebang#\#!}"
-      interp="${interp%% *}"                       # drop args, e.g. `python -E`
-      if [[ "$interp" == */env ]]; then interp=""; fi   # `#!/usr/bin/env python` — no path
-      if [[ -n "$interp" && -x "$interp" ]]; then
+      local rest interp
+      rest="${shebang#\#!}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"      # ltrim
+      interp="${rest%% *}"
+      # `#!/usr/bin/env python3` and `#!/usr/bin/env -S python3 -I` carry the
+      # real interpreter in the arguments, not the path. Resolve it via PATH,
+      # skipping any `-S`/`-i`-style env flags.
+      if [[ "$interp" == */env ]]; then
+        local tok found=""
+        for tok in ${rest#* }; do
+          [[ "$tok" == -* ]] && continue          # env's own flags
+          [[ "$tok" == *=* ]] && continue         # env VAR=val assignments
+          found="$(command -v "$tok" 2>/dev/null || true)"
+          break
+        done
+        interp="$found"
+      fi
+      if [[ -n "$interp" && -x "$interp" ]] && "$interp" -c "import mempalace" 2>/dev/null; then
         echo "$interp"; return
       fi
     fi
