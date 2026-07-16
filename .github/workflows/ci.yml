@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the README promises. 3.12 is what most MemPalace
+        # installs run on today.
+        python-version: ["3.9", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No install step. The browser is stdlib-only, and the tests run it in
+      # demo mode, so CI needs neither MemPalace nor a vector database. If a
+      # dependency ever appears here, something has gone wrong with the design.
+      - name: Syntax
+        run: |
+          python -m compileall -q app.py tests/
+          bash -n run.sh
+
+      - name: Tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Demo mode boots without MemPalace
+        run: |
+          python -c "import mempalace" 2>/dev/null && { echo "CI unexpectedly has mempalace"; exit 1; } || true
+          MPB_DEMO=1 MPB_PORT=8123 python -u app.py &
+          for i in $(seq 1 50); do
+            curl -sf -m 2 http://127.0.0.1:8123/api/health >/dev/null && break
+            sleep 0.2
+          done
+          curl -sf -m 5 http://127.0.0.1:8123/api/health | tee /dev/stderr | grep -q '"ok": true'
+          echo "  demo mode serves on a machine with no MemPalace installed"
+
+      - name: Refuses an unknown Host (DNS-rebinding defence)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Host: evil.example' http://127.0.0.1:8123/api/data)
+          test "$code" = "403" || { echo "HOST BYPASS: got $code, expected 403"; exit 1; }
+          echo "  Host: evil.example -> 403"

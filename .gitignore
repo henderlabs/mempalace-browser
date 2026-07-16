@@ -14,12 +14,29 @@ dist/
 venv/
 env/
 
+# secrets — belt and braces. Nothing here should ever exist in this repo,
+# and if it does, it should not be the commit that finds out.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*credentials*
+*secrets*
+id_rsa
+id_ed25519
+
+# local dumps / scratch
+*.log
+*.sqlite3
+*.db
+*.dump
+_check.mjs
+
 # editors
 .vscode/
 .idea/
 *.swp
 .DS_Store
-
-# local
-*.log
-_check.mjs

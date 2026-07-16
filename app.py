@@ -32,7 +32,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------- config
 # Localhost by default: this is a browser for YOUR private palace, and drawers
@@ -59,30 +59,56 @@ PYPI_TTL = 3600           # seconds to cache the PyPI lookup
 PALACE_TTL = 30           # seconds to cache the palace read
 PYPI_URL = "https://pypi.org/pypi/mempalace/json"
 
-try:
-    from mempalace.version import __version__ as MP_VERSION
-    from mempalace.palace import get_collection
-    from mempalace.config import MempalaceConfig
-except ImportError:
-    sys.exit(
-        "ERROR: cannot import mempalace.\n"
-        "Run this with an interpreter that has MemPalace installed — use\n"
-        "run.sh, which finds it from your `mempalace` command automatically."
-    )
+# Demo mode renders synthetic drawers and never imports mempalace. It exists so
+# you can see the interface without pointing it at your own memory, so the
+# README screenshot contains nobody's real life, and so the tests can exercise
+# the whole server without installing a vector database in CI.
+DEMO = os.environ.get("MPB_DEMO") == "1"
 
-# Ask MemPalace where its palace is; never re-derive it. MempalaceConfig
-# resolves MEMPALACE_PALACE_PATH / MEMPAL_PALACE_PATH, then config.json's
-# palace_path key, then the default. Reimplementing that would silently ignore
-# the config of anyone who moved their palace.
-_cfg = MempalaceConfig()
-PALACE_PATH = _cfg.palace_path
-COLLECTION = _cfg.collection_name
-BACKEND = (_cfg.backend or "chroma").lower()
+# The only outbound request this program ever makes is the PyPI version check,
+# and it is disclosed in the README. It sends no palace data — it fetches a
+# fixed URL and reads one version string. Set MPB_CHECK_UPDATES=0 to make the
+# program fully offline; the chip then reads "update check off", which is
+# honest, rather than pretending to know.
+#
+# Demo mode defaults it OFF: a demonstration should not quietly reach the
+# network, and comparing a fake version against real PyPI would render "update
+# available" for a version that does not exist.
+CHECK_UPDATES = os.environ.get("MPB_CHECK_UPDATES", "0" if DEMO else "1") != "0"
+
+if DEMO:
+    MP_VERSION = "0.0.0-demo"
+    PALACE_PATH = "(demo — no palace is being read)"
+    COLLECTION = "demo"
+    BACKEND = "demo"
+    get_collection = None
+else:
+    try:
+        from mempalace.version import __version__ as MP_VERSION
+        from mempalace.palace import get_collection
+        from mempalace.config import MempalaceConfig
+    except ImportError:
+        sys.exit(
+            "ERROR: cannot import mempalace.\n"
+            "Run this with an interpreter that has MemPalace installed — use\n"
+            "run.sh, which finds it from your `mempalace` command automatically.\n"
+            "\n"
+            "To see the interface without a palace:  MPB_DEMO=1 ./run.sh"
+        )
+
+    # Ask MemPalace where its palace is; never re-derive it. MempalaceConfig
+    # resolves MEMPALACE_PALACE_PATH / MEMPAL_PALACE_PATH, then config.json's
+    # palace_path key, then the default. Reimplementing that would silently
+    # ignore the config of anyone who moved their palace.
+    _cfg = MempalaceConfig()
+    PALACE_PATH = _cfg.palace_path
+    COLLECTION = _cfg.collection_name
+    BACKEND = (_cfg.backend or "chroma").lower()
 
 # The palace dir normally lives inside the data dir (~/.mempalace/palace), whose
 # parent also holds knowledge_graph.sqlite3, wal/, hallways.json — real
 # footprint a storage panel should count.
-DATA_PATH = os.path.dirname(PALACE_PATH.rstrip("/")) or PALACE_PATH
+DATA_PATH = "" if DEMO else (os.path.dirname(PALACE_PATH.rstrip("/")) or PALACE_PATH)
 
 # Only chroma and sqlite_exact keep drawers on this filesystem. For pgvector and
 # qdrant the data lives on another host entirely, so local disk figures would be
@@ -106,6 +132,15 @@ def _parse_version(v):
 
 def version_info(force=False):
     """Installed vs latest. Never claims 'current' when the check failed."""
+    if not CHECK_UPDATES:
+        # Say what is true: we did not look. Not "up to date".
+        return {
+            "installed": MP_VERSION,
+            "latest": None,
+            "status": "disabled",
+            "error": None,
+            "checked_at": None,
+        }
     with _pypi_lock:
         stale = (time.time() - _pypi_cache["at"]) > PYPI_TTL
         if force or stale or (_pypi_cache["latest"] is None and _pypi_cache["error"] is None):
@@ -168,6 +203,16 @@ def _mount_of(path):
 
 def storage_info():
     """Local disk figures, or an honest explanation of why there are none."""
+    if DEMO:
+        # Synthetic, like the drawers. The whole page is labelled DEMO; a
+        # storage panel that only ever reads "n/a" cannot show what it is for.
+        return {"available": True, "backend": "demo",
+                "palace_bytes": 3_842_048, "palace_files": 13,
+                "data_bytes": 3_951_616, "data_files": 19,
+                "disk_total": 52_521_566_208, "disk_used": 4_202_725_376,
+                "disk_free": 48_318_840_832,
+                "mount": "/opt/mempalace", "dedicated": True,
+                "data_path": "(demo)"}
     if BACKEND not in LOCAL_BACKENDS:
         return {
             "available": False,
@@ -212,10 +257,74 @@ _palace_cache = {"at": 0.0, "data": None}
 _palace_lock = threading.Lock()
 
 
+def _demo_drawers():
+    """Obviously-synthetic drawers. Nothing here is anyone's real memory."""
+    now = datetime.now(timezone.utc)
+    spec = [
+        ("Orchard", "decisions", 1, "sample-decisions.md",
+         "# Chose SQLite over Postgres for the ledger\n\nThe ledger is single-writer and "
+         "under a gigabyte. Postgres would add an operational dependency to a program "
+         "that otherwise has none. Revisit if concurrent writers ever appear.\n\n"
+         "Decided after the March load test showed 40x headroom."),
+        ("Orchard", "decisions", 96, "sample-decisions.md",
+         "# Rejected the plugin architecture\n\nTwo plugins existed and both were written "
+         "by us. The abstraction cost more than it saved. Deleted 900 lines; behaviour "
+         "unchanged."),
+        ("Orchard", "deploy", 4, "sample-deploy.md",
+         "# Deploy is a git archive of the SHA\n\nThe image tag IS the commit SHA, so a "
+         "running container always names the source it came from. No `latest`, ever."),
+        ("Orchard", "deploy", 38, "sample-deploy.md",
+         "# Postmortem: the health check that could not fail\n\nThe status endpoint "
+         "returned 200 with the error text in the body, so monitoring saw a healthy "
+         "service for six weeks. A health check that cannot fail is not a health check."),
+        ("Greenhouse", "notes", 12, "sample-notes.md",
+         "# Watering schedule\n\nTomatoes every other day, deeply, in the morning. "
+         "Basil daily. The rosemary wants to be forgotten about."),
+        ("Greenhouse", "notes", 158, "sample-notes.md",
+         "# Seed order arrived\n\nHeirloom tomato, two varieties of basil, and the "
+         "pepper seeds that never germinate but hope springs eternal."),
+        ("Workshop", "reference", 67, "sample-reference.md",
+         "# Torque values\n\nAluminium: go slow, and stop the moment it stops feeling "
+         "like it is tightening. The thread will not warn you twice."),
+        ("Workshop", "reference", 205, "sample-reference.md",
+         "# Sharpening angles\n\nKitchen knives 15 degrees per side. Chisels 25. "
+         "The angle matters less than being consistent about it."),
+        ("Workshop", "projects", 250, "sample-projects.md",
+         "# Bench rebuild\n\nThe top is cupped about 3mm across the width. Flatten with "
+         "winding sticks before adding the vice, not after."),
+    ]
+    out = []
+    for wing, room, days_ago, src, content in spec:
+        filed = (now - timedelta(days=days_ago)).isoformat(timespec="microseconds")
+        out.append({
+            "id": f"drawer_{wing}_{room}_{abs(hash((wing, room, content))) % (16**24):024x}",
+            "wing": wing, "room": room, "filed_at": filed,
+            "added_by": "demo", "source_file": src,
+            "content": content, "bytes": len(content.encode("utf-8")),
+            "meta": {"wing": wing, "room": room, "filed_at": filed,
+                     "added_by": "demo", "source_file": src, "chunk_index": "0"},
+        })
+    return out
+
+
 def read_palace(force=False):
     with _palace_lock:
         if not force and _palace_cache["data"] and (time.time() - _palace_cache["at"]) < PALACE_TTL:
             return _palace_cache["data"]
+
+        if DEMO:
+            drawers = _demo_drawers()
+            drawers.sort(key=lambda d: d["filed_at"], reverse=True)
+            now = time.time()
+            data = {
+                "drawers": drawers, "count": len(drawers),
+                "palace_path": PALACE_PATH,
+                "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+                "storage": storage_info(),
+                "demo": True,
+            }
+            _palace_cache.update(at=now, data=data)
+            return data
 
         col = get_collection(
             PALACE_PATH,
@@ -286,10 +395,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Explain the refusal in the medium the caller is actually using."""
         host = self.headers.get("Host", "(none)")
         name = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
-        sys.stderr.write(
-            f"  refused request for Host: {host!r} — not in MPB_ALLOWED_HOSTS.\n"
-            f"  If this is you, add it:  MPB_ALLOWED_HOSTS={name} ./run.sh\n"
-        )
+        # Route through log_message rather than sys.stderr directly, so there is
+        # one logging path and callers can silence it.
+        self.log_message("refused Host %r — not allowed. If this is you: "
+                         "MPB_ALLOWED_HOSTS=%s ./run.sh", host, name)
         if path.startswith("/api/"):
             self._send(403, json.dumps({
                 "error": "host not allowed",
@@ -796,6 +905,10 @@ function renderChips(){
     vc.className = "chip act"; vc.innerHTML = `<b>${inst}</b> · ahead of PyPI (${late})`;
   } else if(v.status === "checking"){
     vc.className = "chip act"; vc.innerHTML = `<b>${inst}</b> · checking…`;
+  } else if(v.status === "disabled"){
+    // We did not look. Say that, rather than implying anything about it.
+    vc.className = "chip"; vc.innerHTML = `<b>${inst}</b> · update check off`;
+    vc.title = "MPB_CHECK_UPDATES=0 — no outbound requests are made";
   } else {
     // PyPI unreachable. Say so — never imply "current".
     vc.className = "chip act unknown"; vc.innerHTML = `<b>${inst}</b> · update check failed`;
@@ -865,7 +978,7 @@ if __name__ == "__main__":
     except Exception as e:
         sys.exit(f"ERROR: cannot read palace at {PALACE_PATH}\n  {type(e).__name__}: {e}")
 
-    if d["count"] == 0:
+    if d["count"] == 0 and not DEMO:
         sys.exit(
             f"ERROR: palace at {PALACE_PATH} reports 0 drawers.\n"
             "Refusing to start — this is what a wrong path looks like."
@@ -874,11 +987,12 @@ if __name__ == "__main__":
     # Warm the PyPI check in the background. The installed version is local and
     # instant; only the comparison needs the network. Blocking the banner on it
     # means an offline user waits out a timeout just to be told their URL.
-    threading.Thread(target=version_info, kwargs={"force": True}, daemon=True).start()
+    if CHECK_UPDATES:
+        threading.Thread(target=version_info, kwargs={"force": True}, daemon=True).start()
 
     s = d["storage"]
     print("=" * 60)
-    print("  MemPalace Browser")
+    print("  MemPalace Browser" + ("  [DEMO — synthetic data]" if DEMO else ""))
     print("=" * 60)
     print(f"  palace    : {PALACE_PATH}")
     print(f"  backend   : {BACKEND}")
@@ -890,7 +1004,10 @@ if __name__ == "__main__":
               f"{', dedicated' if s['dedicated'] else ', SHARED WITH OS'})")
     else:
         print(f"  storage   : n/a — {s.get('reason')}")
-    print(f"  installed : {MP_VERSION}  (checking PyPI in background)")
+    if CHECK_UPDATES:
+        print(f"  installed : {MP_VERSION}  (checking PyPI in background)")
+    else:
+        print(f"  installed : {MP_VERSION}  (update check off — no outbound requests)")
     print(f"  serving   : http://{BIND}:{PORT}/")
     print(f"  hosts     : {', '.join(sorted(ALLOWED_HOSTS))}")
     if BIND != "127.0.0.1":

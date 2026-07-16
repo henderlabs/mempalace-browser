@@ -81,6 +81,18 @@ find_python() {
   return 1
 }
 
+# Demo mode never touches a palace, so it does not need MemPalace's interpreter.
+# Any python3 will do. This is what makes `MPB_DEMO=1 ./run.sh` work on a machine
+# that has never heard of MemPalace — which is the point of it.
+if [[ "${MPB_DEMO:-}" == "1" ]]; then
+  PY="${MEMPALACE_PYTHON:-$(command -v python3 || command -v python)}"
+  if [[ -z "$PY" ]]; then
+    echo "ERROR: demo mode needs python3 on PATH." >&2
+    exit 1
+  fi
+  exec "$PY" -u "$APP" "$@"
+fi
+
 if ! PY="$(find_python)"; then
   cat >&2 <<'EOF'
 ERROR: could not find a Python interpreter with MemPalace installed.

@@ -2,10 +2,9 @@
 
 > A fast, read-only web browser for your private [MemPalace](https://github.com/MemPalace/mempalace).
 
-MemPalace stores your AI's memory as drawers, filed into rooms and wings. It is excellent at
-letting an agent retrieve them and offers no way for *you* to look. This is one page that shows
-you what is actually in there: browse the wings, read the drawers, search the lot, and see how
-much disk it is using.
+MemPalace stores your AI's memory as drawers, filed into rooms and wings. It is optimised for
+agent retrieval — an agent asks, and the right memories come back. This is the human view of the
+same data: browse the wings, read the drawers, search the lot, and see how much disk it is using.
 
 One file, standard library only, no database of its own, no build step.
 
@@ -34,6 +33,13 @@ cd mempalace-browser
 
 Open <http://127.0.0.1:8080/>. `Ctrl-C` stops it.
 
+Want to see it before pointing it at your own memory? Demo mode renders synthetic drawers and
+never imports MemPalace, so it runs anywhere:
+
+```bash
+MPB_DEMO=1 ./run.sh
+```
+
 `run.sh` finds the right Python by reading the shebang of your `mempalace` command, so it works
 whether you installed with `uv tool`, `pipx`, `pip`, or a venv. If it cannot find one, it tells you
 what it tried and how to point it manually.
@@ -47,10 +53,29 @@ Everything is optional. Defaults are chosen so that running it with no configura
 | `MPB_BIND` | `127.0.0.1` | Interface to bind. **See [Security](#security) before changing this.** |
 | `MPB_PORT` | `8080` | Port to listen on |
 | `MPB_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Extra `Host` headers to accept, comma-separated. Needed if you reach it by a hostname — e.g. `MPB_ALLOWED_HOSTS=palace.lan` |
+| `MPB_CHECK_UPDATES` | `1` | `0` disables the PyPI version check — see [Network](#network) |
+| `MPB_DEMO` | *(off)* | `1` renders synthetic drawers and never imports MemPalace |
 | `MEMPALACE_PYTHON` | *(auto-detected)* | Interpreter to use, if auto-detection picks wrong |
 
 The palace itself is located by asking MemPalace, so `MEMPALACE_PALACE_PATH` and your
 `config.json` are honored automatically — there is no separate path setting to keep in sync.
+
+## Network
+
+**One outbound request, and you can turn it off.** On startup the browser fetches
+`https://pypi.org/pypi/mempalace/json` to see whether a newer MemPalace has been released. It
+sends **no palace data** — it reads one version string from a fixed URL. The result is cached for
+an hour.
+
+```bash
+MPB_CHECK_UPDATES=0 ./run.sh    # no outbound requests at all
+```
+
+The version chip then reads *"update check off"* rather than implying anything about your version.
+Demo mode disables it by default.
+
+There is no telemetry, no analytics, and no other outbound traffic. If you see any, that is a bug
+— please [report it](SECURITY.md).
 
 ## Security
 
@@ -97,6 +122,11 @@ Drawer browsing is backend-agnostic — it goes through MemPalace's own collecti
 
 On remote backends the storage panel says so rather than reporting misleading local disk numbers.
 
+Checked against MemPalace **3.5.0**, the current release. Upstream's `develop` branch adds a
+`milvus` backend for 3.6.0 — when that ships, drawer browsing should work untouched (it goes
+through MemPalace's own collection API), but Milvus Lite is *local*, so the storage panel will
+need teaching about it rather than calling it remote.
+
 ## Design notes
 
 Three decisions are deliberate, and each one is load-bearing:
@@ -128,9 +158,14 @@ palace cannot be read. A health check that cannot fail is not a health check.
 
 ## Contributing
 
-Issues and pull requests are welcome. This is a small tool with a deliberately small scope — if a
-change adds a dependency or a build step, please open an issue first so we can talk about whether
-the simplicity is worth trading.
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The scope is
+deliberately small: one file, standard library only, read-only. That is the feature, not a phase.
+
+Security issues go through [private reporting](SECURITY.md), not public issues.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## License
 
