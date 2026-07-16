@@ -301,15 +301,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # see {"error":"host not allowed"} and reasonably conclude it is broken.
         # The Host header is attacker-controlled, so escape it — reflecting it
         # raw would be XSS in the very code path added to stop an attack.
-        # Deliberately does NOT print the allowed-host list. It is not
-        # exploitable — a rebinding attacker cannot forge Host, browsers set it
-        # — but it hands internal hostnames to any caller, and the actionable
-        # line is the command with their own name in it. The operator sees the
-        # full list in the terminal, where it belongs.
-        self._send(403, HOST_REFUSED_HTML
-                   .replace("{{HOST}}", html.escape(host))
-                   .replace("{{NAME}}", html.escape(name)),
-                   "text/html; charset=utf-8")
+        # Substitute in ONE pass. Chaining .replace() calls would let a value
+        # inserted by an earlier pass be re-substituted by a later one — send
+        # `Host: {{NAME}}` and the second replace chews on text the first one
+        # wrote. Escaping means that is cosmetic rather than exploitable, but a
+        # template that reprocesses its own output is a bad habit to ship.
+        subs = {"{{HOST}}": html.escape(host), "{{NAME}}": html.escape(name)}
+        page = re.sub(r"\{\{(?:HOST|NAME)\}\}",
+                      lambda m: subs[m.group(0)], HOST_REFUSED_HTML)
+        # Deliberately does NOT print the allowed-host list. Not exploitable —
+        # a rebinding attacker cannot forge Host, browsers set it — but it hands
+        # internal hostnames to any caller, and the actionable line is the
+        # command with their own name in it. The operator sees the full list in
+        # the terminal, where it belongs.
+        self._send(403, page, "text/html; charset=utf-8")
 
     def do_GET(self):
         path, _, qs = self.path.partition("?")
