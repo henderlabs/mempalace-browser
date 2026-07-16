@@ -12,6 +12,8 @@ One file, standard library only, no database of its own, no build step.
 > affiliated with, endorsed by, or maintained by the MemPalace project. Bugs here are ours — please
 > report them [in this repo](https://github.com/henderlabs/mempalace-browser/issues), not upstream.
 
+![MemPalace Browser demo screenshot](assets/demo.png)
+
 ## Status
 
 Working and in daily use. Best-effort maintenance: issues and PRs are welcome, but no support or
