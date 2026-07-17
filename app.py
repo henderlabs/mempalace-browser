@@ -32,6 +32,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import warnings
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------- config
@@ -41,6 +43,27 @@ from datetime import datetime, timedelta, timezone
 # ones you did not think about. Change it deliberately, not by default.
 BIND = os.environ.get("MPB_BIND", "127.0.0.1")
 PORT = int(os.environ.get("MPB_PORT", "8080"))
+
+# This browser's own version. Deliberately separate from MemPalace's: the chip
+# in the header reports MemPalace's version, because that is the number a user
+# is actually asking about, and conflating the two is how a browser ends up
+# claiming its host library is out of date.
+MPB_VERSION = "0.2.0"
+REPO_URL = "https://github.com/henderlabs/mempalace-browser"
+
+# The HenderLabs mark — three layers, painted bottom to top. Inlined rather
+# than read from assets/ because this program is one file with no static dir,
+# and a favicon that 404s is worse than none.
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="HenderLabs">
+  <rect width="64" height="64" rx="14" fill="#050B14"/>
+  <g stroke-linejoin="round" stroke-linecap="round" fill="none">
+    <path d="M12 39 L32 50 L52 39" stroke="#FFFFFF" stroke-width="6"/>
+    <path d="M12 31 L32 42 L52 31" stroke="#050B14" stroke-width="13"/>
+    <path d="M12 31 L32 42 L52 31" stroke="#6E7886" stroke-width="6"/>
+    <path d="M32 11 L52 22 L32 33 L12 22 Z" stroke="#050B14" stroke-width="10"/>
+    <path d="M32 11 L52 22 L32 33 L12 22 Z" fill="#0D6BFF" stroke="#0D6BFF" stroke-width="4"/>
+  </g>
+</svg>"""
 
 # DNS-rebinding defence. "No auth because it's localhost" only holds if the
 # browser cannot be tricked into treating us as same-origin. A malicious page
@@ -211,7 +234,7 @@ def storage_info():
                 "data_bytes": 3_951_616, "data_files": 19,
                 "disk_total": 52_521_566_208, "disk_used": 4_202_725_376,
                 "disk_free": 48_318_840_832,
-                "mount": "/opt/mempalace", "dedicated": True,
+                "mount": "/srv/demo-palace", "dedicated": True,
                 "data_path": "(demo)"}
     if BACKEND not in LOCAL_BACKENDS:
         return {
@@ -252,9 +275,207 @@ def storage_info():
     }
 
 
+# ---------------------------------------------------------------- documents
+def _chunk_sort_key(d):
+    """Order chunks within a document.
+
+    chunk_index is scoped to (source_file, ROOM), not to the file: the miner
+    restarts numbering for every room a file's chunks land in. So room comes
+    first in the key, and a multi-room document reads as one contiguous run per
+    room rather than seven interleaved sequences that all start at zero.
+
+    The remaining fallbacks handle a field that is absent on some drawers and
+    genuinely duplicated on others. An arbitrary but STABLE order beats a
+    different order on every reload.
+    """
+    ci = d.get("chunk_index")
+    return (d.get("room") or "", ci is None, ci if isinstance(ci, int) else 0,
+            d.get("filed_at") or "", d["id"])
+
+
+def build_documents(drawers):
+    """Group chunks back into the file they were mined from.
+
+    A drawer is a ~800-character slice. The thing a person actually wrote is
+    the file, so reading a 27-chunk document as 27 fragments — each starting
+    mid-sentence — makes real content look like corrupted data.
+
+    source_file is treated as an OPAQUE key, because it is free text rather
+    than a path: it holds absolute paths, bare filenames, and prose labels
+    ("telegram conversation"). Two spellings of one file therefore stay two
+    documents. That is deliberate — merging them means guessing, and a wrong
+    merge silently fuses two people's notes into one.
+
+    Documents are NOT a level of the wing/room tree. The miner files chunks by
+    topic, so one file's chunks legitimately scatter across rooms (in the
+    palace this was built against, workbench.md spans seven). A document is a
+    lens over drawers, never a branch of them.
+    """
+    groups = defaultdict(list)
+    for d in drawers:
+        if d.get("source_file"):          # "" and None are both "no document"
+            groups[d["source_file"]].append(d)
+
+    docs = []
+    for key, items in groups.items():
+        if len(items) < 2:
+            # A one-chunk group is just a drawer wearing a document costume.
+            continue
+        items = sorted(items, key=_chunk_sort_key)
+
+        # Say when the order is not trustworthy — but check it per ROOM, because
+        # that is the scope the miner numbers in. Checking chunk_index across a
+        # whole file reports a duplicate for every multi-room document, which is
+        # the miner working exactly as designed: a 27-chunk file spanning seven
+        # rooms legitimately has seven chunks numbered 0. Flagging that would
+        # cry wolf on the healthy case and bury the real one.
+        issues = []
+        unnumbered = sum(1 for d in items if d.get("chunk_index") is None)
+        if unnumbered:
+            issues.append("%d chunk(s) carry no chunk_index" % unnumbered)
+
+        per_room = defaultdict(list)
+        for d in items:
+            if isinstance(d.get("chunk_index"), int):
+                per_room[d["room"]].append(d["chunk_index"])
+        dupe_rooms, gap_rooms = [], []
+        for rm, idx in per_room.items():
+            if len(set(idx)) != len(idx):
+                dupe_rooms.append(rm)
+            elif sorted(idx) != list(range(len(idx))):
+                gap_rooms.append(rm)
+        if dupe_rooms:
+            # Two drawers claiming the same chunk of the same room means this
+            # content was filed more than once. Stating what the data shows,
+            # not why — the cause is upstream's business, but a reader deserves
+            # to know some of what follows is duplicated.
+            issues.append("filed more than once — duplicate chunk numbers in %s"
+                          % ", ".join(sorted(dupe_rooms)))
+        if gap_rooms:
+            issues.append("chunk numbering has gaps in %s" % ", ".join(sorted(gap_rooms)))
+
+        filed = sorted(d["filed_at"] for d in items if d["filed_at"])
+        docs.append({
+            "key": key,
+            "n": len(items),
+            "ids": [d["id"] for d in items],
+            "wings": sorted({d["wing"] for d in items}),
+            "rooms": sorted({d["room"] for d in items}),
+            "bytes": sum(d["bytes"] for d in items),
+            "first": filed[0] if filed else "",
+            "last": filed[-1] if filed else "",
+            "issues": issues,
+        })
+    docs.sort(key=lambda x: (-x["n"], x["key"]))
+    return docs
+
+
+# ---------------------------------------------------------------- layers
+def _layer_counts(drawers):
+    """Count every layer a palace advertises — including the empty ones.
+
+    This is the panel this program exists to make honest. MemPalace offers
+    closets, halls, entities, hallways, tunnels and a knowledge graph, and in
+    a typical palace most of them have never been written to. Nothing tells
+    you that: an empty knowledge graph answers kg_query with count:0, which
+    reads as "there are no such facts" rather than "this layer does not
+    exist". Showing the coverage is the whole difference.
+
+    Every probe is individually guarded: a layer we cannot read reports
+    "unavailable", never zero. Zero and unknown are different claims.
+    """
+    total = len(drawers) or 1
+    halls = Counter(d["meta"].get("hall") for d in drawers if d["meta"].get("hall"))
+    ents = sum(1 for d in drawers if d["meta"].get("entities"))
+
+    # Passive tunnels: the same room name appearing in two or more wings.
+    # Computed here from metadata we already hold rather than calling
+    # graph_stats(), which would re-read the entire collection to learn what
+    # is already in memory. Note the match is exact-string and case-sensitive,
+    # which is MemPalace's own behaviour — `Decisions` does not bridge to
+    # `decisions`. Mirroring that is the point; "fixing" it here would report
+    # tunnels the palace itself does not have.
+    rooms_to_wings = defaultdict(set)
+    for d in drawers:
+        rooms_to_wings[d["room"]].add(d["wing"])
+    passive = sum(1 for w in rooms_to_wings.values() if len(w) > 1)
+
+    out = {
+        "drawers": {"n": len(drawers), "pct": 100},
+        "halls": {"n": sum(halls.values()), "pct": round(sum(halls.values()) / total * 100),
+                  "values": halls.most_common()},
+        "entities": {"n": ents, "pct": round(ents / total * 100)},
+        "tunnels_passive": {"n": passive},
+    }
+
+    if DEMO:
+        out["closets"] = {"n": 2}
+        out["hallways"] = {"n": 0}
+        out["tunnels_explicit"] = {"n": 0}
+        out["kg"] = {"entities": 0, "triples": 0}
+        return out
+
+    try:
+        cc = get_collection(PALACE_PATH, collection_name="mempalace_closets", create=False)
+        out["closets"] = {"n": cc.count()}
+    except Exception as e:
+        out["closets"] = {"error": str(e)[:80]}
+
+    try:
+        from mempalace.hallways import list_hallways
+        out["hallways"] = {"n": len(list_hallways())}
+    except Exception as e:
+        out["hallways"] = {"error": str(e)[:80]}
+
+    try:
+        from mempalace.palace_graph import list_tunnels
+        out["tunnels_explicit"] = {"n": len(list_tunnels())}
+    except Exception as e:
+        out["tunnels_explicit"] = {"error": str(e)[:80]}
+
+    # ALWAYS report which file this came from. There is more than one candidate
+    # and they disagree: mcp_server._resolve_kg_path() returns
+    # <palace_path>/knowledge_graph.sqlite3 when the server was started with an
+    # explicit --palace, and knowledge_graph.DEFAULT_KG_PATH (~/.mempalace/...)
+    # otherwise. Those are different files even when --palace names the default
+    # path, so an agent and this browser can read the same palace and give
+    # different answers about its graph. KnowledgeGraph() creates a missing file
+    # rather than failing, so the losing side reports a confident zero instead
+    # of an error. A count without its path is not an answer.
+    try:
+        from mempalace.knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH
+        kg = KnowledgeGraph()
+        try:
+            s = kg.stats() or {}
+            out["kg"] = {"entities": s.get("entities", 0),
+                         "triples": s.get("triples", 0),
+                         "path": DEFAULT_KG_PATH}
+        finally:
+            kg.close()
+        alt = os.path.join(PALACE_PATH, "knowledge_graph.sqlite3")
+        if os.path.realpath(alt) != os.path.realpath(DEFAULT_KG_PATH) and os.path.exists(alt):
+            out["kg"]["rival"] = alt
+    except Exception as e:
+        out["kg"] = {"error": str(e)[:80]}
+
+    return out
+
+
 # ---------------------------------------------------------------- palace read
 _palace_cache = {"at": 0.0, "data": None}
 _palace_lock = threading.Lock()
+
+# MemPalace raises a palace's warnings exactly ONCE per process — the second
+# get_collection() for the same collection is silent. Our read is cached for
+# PALACE_TTL, so capturing per-read means the warning shows for thirty seconds
+# and then the status goes green and stays green: a health check that heals
+# itself by forgetting. Latch them instead. The condition (e.g. no recorded
+# embedder identity) is a property of the palace, not of one read.
+#
+# It deliberately cannot un-latch. The same once-per-process rule means we
+# could not observe the fix either, and a warning that clears itself without
+# evidence is the bug, not the feature. Restart to re-evaluate.
+_palace_notes_seen = []
 
 
 def _demo_drawers():
@@ -294,15 +515,20 @@ def _demo_drawers():
          "winding sticks before adding the vice, not after."),
     ]
     out = []
+    seq = Counter()
     for wing, room, days_ago, src, content in spec:
         filed = (now - timedelta(days=days_ago)).isoformat(timespec="microseconds")
+        # Number the chunks per source file, the way a real mine does — it is
+        # what makes the Documents view demonstrate anything.
+        ci = seq[src]
+        seq[src] += 1
         out.append({
             "id": f"drawer_{wing}_{room}_{abs(hash((wing, room, content))) % (16**24):024x}",
             "wing": wing, "room": room, "filed_at": filed,
-            "added_by": "demo", "source_file": src,
+            "added_by": "demo", "source_file": src, "chunk_index": ci,
             "content": content, "bytes": len(content.encode("utf-8")),
             "meta": {"wing": wing, "room": room, "filed_at": filed,
-                     "added_by": "demo", "source_file": src, "chunk_index": "0"},
+                     "added_by": "demo", "source_file": src, "chunk_index": str(ci)},
         })
     return out
 
@@ -321,16 +547,34 @@ def read_palace(force=False):
                 "palace_path": PALACE_PATH,
                 "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
                 "storage": storage_info(),
+                "documents": build_documents(drawers),
+                "layers": _layer_counts(drawers),
+                "palace_notes": [],
+                "mpb_version": MPB_VERSION,
+                "repo_url": REPO_URL,
                 "demo": True,
             }
             _palace_cache.update(at=now, data=data)
             return data
 
-        col = get_collection(
-            PALACE_PATH,
-            collection_name=COLLECTION,
-            create=False,            # never manufacture a palace
-        )
+        # Capture warnings MemPalace raises while opening the collection. The
+        # embedder-identity warning is the one that matters: it goes to stderr
+        # and nowhere else, so anyone who started this detached never sees it —
+        # yet it means the palace has no recorded embedder, and if the default
+        # model ever changes, new embeddings silently mismatch every drawer
+        # already filed. That is palace health, and it belongs on screen.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            col = get_collection(
+                PALACE_PATH,
+                collection_name=COLLECTION,
+                create=False,            # never manufacture a palace
+            )
+            for w in caught:
+                msg = str(w.message)[:240]
+                if msg not in _palace_notes_seen:
+                    _palace_notes_seen.append(msg)
+
         res = col.get(include=["metadatas", "documents"])
         ids = list(res.ids or [])
         metas = list(res.metadatas or [])
@@ -339,6 +583,7 @@ def read_palace(force=False):
         drawers = []
         for i, did in enumerate(ids):
             m = dict(metas[i] or {})
+            ci = m.get("chunk_index")
             drawers.append({
                 "id": did,
                 "wing": m.get("wing") or "(unfiled)",
@@ -346,6 +591,7 @@ def read_palace(force=False):
                 "filed_at": m.get("filed_at") or "",
                 "added_by": m.get("added_by") or "",
                 "source_file": m.get("source_file") or "",
+                "chunk_index": ci if isinstance(ci, int) else None,
                 "content": docs[i] or "",
                 "bytes": len((docs[i] or "").encode("utf-8")),
                 "meta": {k: str(v) for k, v in m.items()},
@@ -359,6 +605,11 @@ def read_palace(force=False):
             "palace_path": PALACE_PATH,
             "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
             "storage": storage_info(),
+            "documents": build_documents(drawers),
+            "layers": _layer_counts(drawers),
+            "palace_notes": list(_palace_notes_seen),
+            "mpb_version": MPB_VERSION,
+            "repo_url": REPO_URL,
         }
         _palace_cache.update(at=now, data=data)
         return data
@@ -439,6 +690,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+            elif path == "/icon.svg":
+                self._send(200, ICON_SVG, "image/svg+xml")
             elif path == "/api/data":
                 payload = read_palace(force=force)
                 payload["version"] = version_info()
@@ -447,13 +700,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, json.dumps(version_info(force=True)), "application/json")
             elif path == "/api/health":
                 # Reports the truth, including failure. Never a blanket "ok".
+                #
+                # `ok` answers one narrow question — is the palace readable —
+                # so it stays a clean 200/503 for anything scripting this.
+                # `status` is the honest overall state, and it degrades to
+                # "attention" while any warning is live. A green light with an
+                # active warning underneath it is how you end up trusting a
+                # health check that cannot fail.
+                #
+                # Scope: this endpoint reports PALACE INTEGRITY — can we read
+                # it, and is anything about the stored data wrong. The UI adds
+                # operational context on top (disk, version, chunk ordering).
+                # The two must never disagree about green: anything that makes
+                # the chip amber for an integrity reason belongs here too.
                 try:
                     d = read_palace()
-                    self._send(200, json.dumps(
-                        {"ok": True, "drawers": d["count"], "palace": PALACE_PATH}
-                    ), "application/json")
+                    notes = list(d.get("palace_notes") or [])
+                    kg = (d.get("layers") or {}).get("kg") or {}
+                    if kg.get("rival"):
+                        notes.append(
+                            "two knowledge graphs: this reads %s (%d entities, %d triples); "
+                            "an MCP server started with --palace reads %s instead"
+                            % (kg.get("path"), kg.get("entities", 0), kg.get("triples", 0),
+                               kg["rival"])
+                        )
+                    self._send(200, json.dumps({
+                        "ok": True,
+                        "status": "attention" if notes else "healthy",
+                        "drawers": d["count"],
+                        "palace": PALACE_PATH,
+                        "warnings": notes,
+                    }), "application/json")
                 except Exception as e:
-                    self._send(503, json.dumps({"ok": False, "error": str(e)}), "application/json")
+                    self._send(503, json.dumps(
+                        {"ok": False, "status": "error", "error": str(e)}
+                    ), "application/json")
             else:
                 self._send(404, json.dumps({"error": "not found"}), "application/json")
         except Exception as e:
@@ -519,6 +800,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <title>MemPalace Browser</title>
 <style>
   /* HenderLabs brand palette. Dark-only by design — no light mode. */
@@ -537,25 +819,122 @@ INDEX_HTML = r"""<!doctype html>
          font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
          -webkit-font-smoothing:antialiased; }
 
-  header { display:flex; align-items:center; gap:14px; flex-wrap:wrap;
-           padding:0 18px; height:56px; background:rgb(5 8 20 / .95);
+  /* nowrap, deliberately: with a flex:1 search field in here, wrapping drops
+     the clock onto a second row and shoves the whole grid down the page. The
+     field shrinks instead (min-width:0 below), and the pieces that stop
+     earning their width get dropped by the media queries. */
+  header { display:flex; align-items:center; gap:16px; flex-wrap:nowrap;
+           padding:0 22px; height:64px; background:rgb(5 8 20 / .95);
            border-bottom:1px solid var(--line); backdrop-filter:blur(6px); }
-  .wordmark { font-size:1.125rem; font-weight:700; letter-spacing:-.02em;
-              margin-right:2px; white-space:nowrap; }
+  header .mark { width:26px; height:26px; flex:none; }
+  header .chip, header .brand, header .clock, header button.refresh { flex:none; }
+  @media (max-width:1180px){ .tagline { display:none; } }
+  @media (max-width:1020px){ .clock { display:none; } }
+  @media (max-width:880px){ #cntChip, #verChip .who { display:none; } }
+  @media (max-width:820px){
+    header { flex-wrap:wrap; height:auto; padding:9px 14px; gap:10px; }
+    #q { order:10; flex:1 0 100%; }
+  }
+  .brand { margin-right:6px; }
+  .wordmark { font-size:1.45rem; font-weight:700; letter-spacing:-.025em;
+              white-space:nowrap; line-height:1.1; }
   .wordmark .b { color:var(--brand); }
-  .path { font-size:11px; color:var(--fg-subtle); font-family:var(--mono); }
+  /* Says the two things a first-time viewer cannot otherwise learn: what this
+     is for, and that looking at it changes nothing. The palace path used to
+     live here; it is a local username and directory layout, it is in every
+     screenshot anyone ever posts, and it belongs in System status instead. */
+  .tagline { font-size:10.5px; color:var(--fg-subtle); white-space:nowrap; }
+  .tagline b { color:var(--fg-muted); font-weight:600; }
 
   .chip { font-size:11.5px; padding:3px 9px; border-radius:999px; white-space:nowrap;
           border:1px solid var(--line-2); background:var(--surface); color:var(--fg-muted); }
   .chip b { color:var(--fg); font-weight:600; }
+  .chip .who { color:var(--graphite); font-weight:500; }
   .chip.act { cursor:pointer; }
   .chip.act:hover { border-color:var(--brand); }
   .chip.current { border-color:rgb(34 197 94 / .5); color:var(--success); }
   .chip.update  { border-color:rgb(245 158 11 / .55); color:var(--warning); }
   .chip.unknown { border-color:rgb(239 68 68 / .5); color:var(--error); }
   .chip.new     { border-color:var(--brand); color:var(--brand); }
+  .chip.ok      { border-color:rgb(34 197 94 / .5); color:var(--success); }
+  .chip.warn    { border-color:rgb(245 158 11 / .55); color:var(--warning); }
+  .chip.bad     { border-color:rgb(239 68 68 / .5); color:var(--error); }
 
-  .spacer { flex:1; }
+  /* Drawers vs Documents. Two lenses over the same 246 drawers, never two
+     hierarchies — a document's chunks scatter across rooms, so it cannot be a
+     branch of the tree. */
+  .views { display:flex; gap:6px; }
+  .view { flex:1; cursor:pointer; font:inherit; font-size:11.5px; padding:5px 6px;
+          border-radius:6px; border:1px solid var(--line-2); background:var(--surface);
+          color:var(--fg-muted); }
+  .view:hover { border-color:var(--brand); color:var(--fg); }
+  .view.sel { border-color:var(--brand); color:var(--fg); background:var(--surface-raised); }
+  .view b { color:var(--fg); font-variant-numeric:tabular-nums; }
+  .view:focus-visible { outline:none; box-shadow:var(--shadow-brand); }
+
+  /* Overlay sheets: System status and the vocabulary intro. */
+  #overlay { position:fixed; inset:0; background:rgb(2 6 13 / .72); z-index:50;
+             display:grid; place-items:center; padding:24px; }
+  #overlay[hidden] { display:none; }
+  .sheet { max-width:680px; width:100%; max-height:82vh; overflow-y:auto;
+           background:var(--surface); border:1px solid var(--line-2);
+           border-radius:11px; padding:22px 24px; }
+  .sheet h2 { font-size:15px; margin:0 0 4px; }
+  .sheet .sub { font-size:12px; color:var(--fg-subtle); margin:0 0 16px; }
+  .sheet h3 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+              color:var(--fg-subtle); margin:18px 0 8px; font-weight:600; }
+  .sheet dl.kv { display:grid; grid-template-columns:auto 1fr; gap:5px 14px;
+                 margin:0; font-size:12.5px; }
+  .sheet dl.kv dt { color:var(--fg-subtle); }
+  .sheet dl.kv dd { margin:0; color:var(--fg-muted); font-family:var(--mono);
+                    font-size:11.5px; word-break:break-all; }
+  .sheet .close { float:right; cursor:pointer; border:1px solid var(--line-2);
+                  background:var(--surface-raised); color:var(--fg-muted);
+                  border-radius:6px; font:inherit; font-size:12px; padding:3px 9px; }
+  .sheet .close:hover { border-color:var(--brand); color:var(--fg); }
+  .note { border-left:2px solid var(--warning); background:rgb(245 158 11 / .07);
+          padding:9px 12px; margin:8px 0; font-size:12.5px; color:var(--fg-muted);
+          border-radius:0 6px 6px 0; }
+  .note.bad { border-left-color:var(--error); background:rgb(239 68 68 / .07); }
+  .vocab { font-size:13px; color:var(--fg-muted); }
+  .vocab p { margin:0 0 10px; }
+  .vocab b { color:var(--fg); }
+
+  /* Layer coverage. The bar is the argument: it shows what the palace
+     advertises next to what is actually in it. */
+  .lay { display:grid; grid-template-columns:82px 1fr auto; gap:4px 8px;
+         align-items:center; font-size:11.5px; }
+  .lay .k { color:var(--fg-muted); }
+  .lay .track { height:5px; border-radius:3px; background:var(--surface-raised);
+                overflow:hidden; }
+  .lay .track i { display:block; height:100%; background:var(--brand); }
+  .lay .track i.zero { background:var(--fg-disabled); }
+  .lay .v { color:var(--fg-subtle); font-variant-numeric:tabular-nums; }
+  .lay .v.none { color:var(--fg-disabled); }
+
+  /* About: whose program this is, which version, and where the source lives.
+     Foot of the informational column — it is a fact about the deployment, not
+     a place to navigate to. The disclaimer sits here rather than buried in a
+     dialog because "MemPalace Browser" reads like a first-party product and
+     it is not one. */
+  /* margin-top:auto eats the slack in the flex column, pinning this to the
+     bottom when the panel is short and letting it flow normally when the
+     content is tall enough to scroll. */
+  .about { border-top:1px solid var(--line); margin-top:auto; padding-top:11px;
+           display:flex; gap:9px; align-items:flex-start; flex:none; }
+  .about .ic { width:20px; height:20px; flex:none; opacity:.85; }
+  .about .nm { font-size:11.5px; font-weight:600; color:var(--fg-muted); line-height:1.35; }
+  .about .nm b { color:var(--brand); font-weight:600; font-variant-numeric:tabular-nums; }
+  /* The byline. Graphite is the logo's middle layer, so it sits under the
+     product name without competing with it — and goes brand blue on hover to
+     admit it is a link. */
+  .about .by { display:block; font-size:10px; color:var(--graphite);
+               text-decoration:none; letter-spacing:.015em; margin-top:1px; }
+  .about .by:hover { color:var(--brand); }
+  .about .sub { font-size:10.5px; color:var(--fg-subtle); line-height:1.45; margin-top:2px; }
+  .about a { color:var(--brand); text-decoration:none; }
+  .about a:hover { color:var(--brand-hover); text-decoration:underline; }
+
   button.refresh { display:flex; align-items:center; gap:7px; cursor:pointer;
       background:var(--surface); color:var(--fg-muted); border:1px solid var(--line-2);
       border-radius:7px; padding:5px 10px; font:inherit; font-size:12px; }
@@ -567,22 +946,42 @@ INDEX_HTML = r"""<!doctype html>
   @keyframes spin { to { transform:rotate(360deg); } }
   .refresh .ago { color:var(--fg-subtle); font-variant-numeric:tabular-nums; }
 
-  .clock { text-align:right; font-variant-numeric:tabular-nums; line-height:1.25; }
-  .clock .local { font-size:13px; font-weight:600; }
-  .clock .utc { font-size:10.5px; color:var(--fg-subtle); font-family:var(--mono); }
+  .clock { text-align:right; font-variant-numeric:tabular-nums; line-height:1.3; }
+  .clock .local { font-size:16px; font-weight:600; letter-spacing:-.01em; }
+  .clock .utc { font-size:11px; color:var(--fg-subtle); font-family:var(--mono); }
 
-  main { display:grid; grid-template-columns:272px 1fr; height:calc(100vh - 56px); }
+  /* Three columns, and the split is a rule not a habit: LEFT navigates (where
+     do I go), CENTRE is content, RIGHT informs (what is true about this
+     palace). Nothing on the right is clickable navigation, nothing on the left
+     is a statistic. */
+  main { display:grid; grid-template-columns:272px 1fr 272px; height:calc(100vh - 64px); }
   #side { border-right:1px solid var(--line); background:var(--bg-alt);
-          display:grid; grid-template-rows:auto 1fr auto; min-height:0; }
+          display:grid; grid-template-rows:auto 1fr; min-height:0; }
   #sideTop { padding:11px; border-bottom:1px solid var(--line); }
   #tree { overflow-y:auto; padding:8px 11px; min-height:0; }
-  #stats { border-top:1px solid var(--line); padding:11px; background:var(--bg-alt); }
+  /* Column, so About can be pushed to the foot with margin-top:auto. It is a
+     colophon — true of the program rather than of your palace — so it belongs
+     out of the way of the figures, not stacked under them like another stat. */
+  #info { border-left:1px solid var(--line); background:var(--bg-alt);
+          overflow-y:auto; padding:11px; min-height:0;
+          display:flex; flex-direction:column; }
+  @media (max-width:1180px){
+    main { grid-template-columns:272px 1fr; }
+    #info { display:none; }          /* content beats chrome when space is tight */
+  }
   @media (max-width:820px){
     main { grid-template-columns:1fr; height:auto; }
     #side { grid-template-rows:none; } #tree { max-height:40vh; }
+    #info { display:block; border-left:none; border-top:1px solid var(--line); }
   }
 
-  #q { width:100%; padding:8px 10px; border-radius:7px; border:1px solid var(--line-2);
+  /* Search lives in the header, filling the gap between the chips and Refresh.
+     It belongs with the global controls rather than above the tree, because it
+     is global: matchesQuery() deliberately ignores the selected wing so the
+     tree can show where hits live across the whole palace. Sitting above the
+     tree implied it searched the selection. It never did. */
+  #q { flex:1 1 auto; min-width:0; padding:8px 11px; border-radius:7px;
+       border:1px solid var(--line-2);
        background:var(--bg); color:var(--fg); font-size:13px; }
   #q::placeholder { color:var(--fg-disabled); }
   #q:focus { outline:none; border-color:var(--brand); box-shadow:var(--shadow-brand); }
@@ -657,16 +1056,43 @@ INDEX_HTML = r"""<!doctype html>
             font-family:var(--mono); line-height:1.65; margin:0; color:var(--fg-muted); }
   .empty { color:var(--fg-subtle); text-align:center; padding:50px 20px; }
   .err { color:var(--error); font-family:var(--mono); font-size:12px; }
+
+  /* A reassembled document. Chunk seams stay visible: this is 27 verbatim
+     slices shown in order, not a file we recovered — and each seam is where
+     the miner made a filing decision worth being able to see. */
+  .card .docmeta { font-size:11px; color:var(--fg-subtle); }
+  .card .nchunk { font-size:9px; font-weight:700; letter-spacing:.06em; padding:1px 5px;
+                  border-radius:3px; background:var(--surface-raised);
+                  color:var(--fg-muted); border:1px solid var(--line-2); }
+  .seam { display:flex; align-items:center; gap:9px; margin:0; padding:7px 0 6px;
+          font-size:10.5px; color:var(--fg-subtle); font-family:var(--mono); }
+  .seam::after { content:""; flex:1; height:1px; background:var(--line); }
+  .seam .rm { color:var(--brand); }
+  .chunks { background:var(--surface); border:1px solid var(--line); border-radius:8px;
+            padding:6px 14px 14px; }
+  .chunks pre { white-space:pre-wrap; word-wrap:break-word; font-size:12.5px;
+                font-family:var(--mono); line-height:1.65; margin:0;
+                color:var(--fg-muted); }
+  .partof { font-size:12px; color:var(--fg-muted); background:var(--surface);
+            border:1px solid var(--line); border-left:2px solid var(--brand);
+            border-radius:0 7px 7px 0; padding:8px 12px; margin:0 0 12px; }
+  .partof a { color:var(--brand); cursor:pointer; text-decoration:none; }
+  .partof a:hover { color:var(--brand-hover); }
 </style>
 </head>
 <body>
 <header>
-  <div class="wordmark">MemPalace<span class="b"> Browser</span></div>
-  <span class="path" id="palacePath"></span>
+  <img class="mark" src="/icon.svg" alt="">
+  <div class="brand">
+    <div class="wordmark">MemPalace<span class="b"> Browser</span></div>
+    <div class="tagline">Browse and search your palace · <b>Read-only</b></div>
+  </div>
+  <span class="chip act" id="healthChip" title="System status">status…</span>
   <span class="chip act" id="verChip" title="Click to re-check PyPI">version…</span>
   <span class="chip" id="cntChip">…</span>
   <span class="chip new" id="newChip" style="display:none"></span>
-  <span class="spacer"></span>
+  <span class="chip act" id="helpChip" title="What are wings and drawers?">?</span>
+  <input id="q" placeholder="Search drawer text across the whole palace…" autocomplete="off">
   <button class="refresh" id="btnRefresh" title="Re-read the palace">
     <span class="ico">⟳</span><span>Refresh</span><span class="ago" id="ago"></span>
   </button>
@@ -677,14 +1103,25 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 <main>
   <div id="side">
-    <div id="sideTop"><input id="q" placeholder="Search drawers…" autocomplete="off"></div>
+    <div id="sideTop">
+      <div class="views">
+        <button class="view sel" data-view="drawers">Drawers <b id="vnDrawers">—</b></button>
+        <button class="view" data-view="documents">Documents <b id="vnDocs">—</b></button>
+      </div>
+    </div>
     <div id="tree"></div>
-    <div id="stats"></div>
   </div>
   <div id="content"><div class="empty">Loading palace…</div></div>
+  <aside id="info"></aside>
 </main>
+<div id="overlay" hidden><div class="sheet" id="sheet"></div></div>
 <script>
 let DATA = null, sel = {wing:null, room:null}, query = "", lastSeen = null, readAt = null;
+// "drawers" = the wing/room tree. "documents" = chunks regrouped into the file
+// they were mined from. Two lenses over one set of drawers, never two trees.
+let view = "drawers";
+let byId = {};              // drawer id -> drawer, for document assembly
+let docOfDrawer = {};       // drawer id -> the document it belongs to
 
 const LS_KEY = "mpb.lastSeen";
 
@@ -692,15 +1129,17 @@ const LS_KEY = "mpb.lastSeen";
 // server-side rendering would show the wrong time. This is always right.
 function tick(){
   const now = new Date();
+  // No seconds. A ticking second-hand is motion where nothing is happening —
+  // it draws the eye away from content that changes only when the palace does.
   document.getElementById("clkLocal").textContent =
     now.toLocaleString(undefined, {weekday:"short", month:"short", day:"numeric",
-                                   hour:"2-digit", minute:"2-digit", second:"2-digit"});
+                                   hour:"2-digit", minute:"2-digit"});
   document.getElementById("clkUtc").textContent =
     Intl.DateTimeFormat().resolvedOptions().timeZone + " · "
-    + now.toISOString().slice(0,19).replace("T"," ") + "Z";
+    + now.toISOString().slice(0,16).replace("T"," ") + "Z";
   if(readAt) document.getElementById("ago").textContent = "· " + ago(readAt);
 }
-setInterval(tick, 1000); tick();
+setInterval(tick, 15000); tick();   // minute resolution needs no 1s timer
 
 function ago(iso){
   const s = Math.max(0, (Date.now() - new Date(iso).getTime())/1000);
@@ -751,6 +1190,9 @@ function wireNav(container){
       if(k === "all")       sel = {wing:null, room:null};
       else if(k === "wing") sel = {wing:el.dataset.w, room:null};
       else if(k === "room") sel = {wing:el.dataset.w, room:el.dataset.r};
+      // Picking a place in the tree is a request for drawers. Documents span
+      // rooms, so a room filter cannot mean anything to them.
+      view = "drawers";
       render();
     };
   });
@@ -784,11 +1226,13 @@ function renderTree(){
            <span class="n">${R.n}</span></div>`).join("")}</div>`;
     div.querySelector(".row").onclick = () => {
       sel = (sel.wing===w && !sel.room) ? {wing:null,room:null} : {wing:w, room:null};
+      view = "drawers";
       render();
     };
     div.querySelectorAll(".room").forEach(el => el.onclick = e => {
       e.stopPropagation();
       sel = {wing:el.dataset.w, room:el.dataset.r};
+      view = "drawers";
       render();
     });
     t.appendChild(div);
@@ -831,12 +1275,97 @@ function renderStats(){
   const max = Math.max(1, ...keys.map(k => counts[k]));
   const mlab = k => new Date(k+"-01").toLocaleDateString(undefined,{month:"short"});
 
-  document.getElementById("stats").innerHTML = storeHtml + `
+  document.getElementById("info").innerHTML = storeHtml + `
     <div class="st-h" style="margin-top:13px">Drawers filed · 12mo</div>
     <div class="spark">${keys.map(k =>
       `<i class="${counts[k]?"has":""}" style="height:${counts[k]? Math.max(8,counts[k]/max*100):2}%"
           title="${mlab(k)} ${k.slice(0,4)}: ${counts[k]}"></i>`).join("")}</div>
-    <div class="spark-x"><span>${mlab(keys[0])}</span><span>${mlab(keys[11])}</span></div>`;
+    <div class="spark-x"><span>${mlab(keys[0])}</span><span>${mlab(keys[11])}</span></div>
+    <div class="st-h" style="margin-top:13px">Layers</div>
+    ${layersHtml()}
+    ${aboutHtml()}`;
+}
+
+// MemPalace's own repository, hardcoded on purpose. Every other URL here is
+// ours to change; this one is a claim about someone else's project, and
+// MemPalace's README carries a malware warning about impostor domains passing
+// themselves off as it. A configurable "upstream" link is a configurable way
+// to send our users somewhere that is not upstream. This is the address their
+// README names as official.
+const MP_REPO = "https://github.com/MemPalace/mempalace";
+
+function aboutHtml(){
+  // rel="noopener noreferrer" on every outbound link: target="_blank" otherwise
+  // hands the opened page a handle back to this one through window.opener.
+  const repo = DATA.repo_url || "";
+  return `<div class="about">
+    <img class="ic" src="/icon.svg" alt="">
+    <div>
+      <div class="nm">MemPalace Browser <b>${esc(DATA.mpb_version || "—")}</b></div>
+      <a class="by" href="https://henderlabs.com" target="_blank"
+         rel="noopener noreferrer">henderlabs.com</a>
+      <div class="sub" style="margin-top:5px">
+        An unofficial companion to
+        <a href="${MP_REPO}" target="_blank" rel="noopener noreferrer"
+           title="${MP_REPO}">MemPalace ↗</a>, which is MIT-licensed and
+        © its contributors. Not affiliated with that project.
+        ${repo ? `<br><a href="${esc(repo)}" target="_blank" rel="noopener noreferrer"
+                    title="${esc(repo)}">This browser's source ↗</a>` : ""}</div>
+    </div>
+  </div>`;
+}
+
+// The palace advertises six layers beyond the drawer. Most palaces have never
+// written to most of them, and nothing anywhere says so — an empty knowledge
+// graph answers a query with count:0, which reads as "no such facts" rather
+// than "no such layer". This panel is the difference between those two, and it
+// is the reason a coverage number appears next to every row instead of a tick.
+function layersHtml(){
+  const L = DATA.layers || {};
+  const total = DATA.count || 1;
+  const rows = [
+    ["Drawers",  L.drawers && L.drawers.n,  total, null],
+    ["Closets",  L.closets && L.closets.n,  total, L.closets && L.closets.error],
+    ["Halls",    L.halls && L.halls.n,      total, null],
+    ["Entities", L.entities && L.entities.n, total, null],
+    ["Hallways", L.hallways && L.hallways.n, null, L.hallways && L.hallways.error],
+    ["Tunnels",  L.tunnels_explicit && L.tunnels_explicit.n, null,
+                 L.tunnels_explicit && L.tunnels_explicit.error],
+  ];
+  let html = rows.map(([k, n, denom, err]) => {
+    if(err !== null && err !== undefined)
+      return `<div class="k">${k}</div><div class="v none" style="grid-column:2/4">unavailable</div>`;
+    if(n === null || n === undefined)
+      return `<div class="k">${k}</div><div class="v none" style="grid-column:2/4">unknown</div>`;
+    const pct = denom ? Math.round(n / denom * 100) : (n ? 100 : 0);
+    const label = denom ? `${n} · ${pct}%` : `${n}`;
+    return `<div class="k">${k}</div>
+            <div class="track"><i class="${n?"":"zero"}" style="width:${n?Math.max(2,pct):100}%"></i></div>
+            <div class="v${n?"":" none"}">${label}</div>`;
+  }).join("");
+
+  // The knowledge graph counts facts, not drawers, so it gets its own row
+  // rather than a coverage bar that would compare two different things.
+  const kg = L.kg || {};
+  if(kg.error !== undefined)
+    html += `<div class="k">Graph</div><div class="v none" style="grid-column:2/4">unavailable</div>`;
+  else
+    html += `<div class="k">Graph</div>
+             <div class="v${kg.entities||kg.triples?"":" none"}" style="grid-column:2/4">
+               ${kg.entities||0} entities · ${kg.triples||0} triples</div>`;
+
+  // A second graph file next to the one we read means an agent talking to this
+  // same palace may be getting a different answer than the number above.
+  // Naming it is the only way anyone finds out.
+  const rival = kg.rival
+    ? `<div class="st-note" style="color:var(--warning);margin-top:6px">
+         ⚠ A second knowledge_graph.sqlite3 exists at <b>${esc(kg.rival)}</b>.
+         An MCP server started with <b>--palace</b> reads that one, not this one.</div>` : "";
+
+  const passive = (L.tunnels_passive && L.tunnels_passive.n) || 0;
+  return `<div class="lay">${html}</div>
+    <div class="st-note" style="margin-top:7px">${passive} passive tunnel${passive===1?"":"s"}
+      — room names shared across wings, derived not stored.</div>${rival}`;
 }
 
 function renderList(){
@@ -873,16 +1402,151 @@ function detail(d){
   const rows = Object.entries(d.meta).filter(([k]) => !skip.has(k))
     .map(([k,v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
   const c = document.getElementById("content");
+
+  // If this drawer is a slice of something longer, say so before showing it.
+  // Otherwise a chunk that opens mid-sentence reads as damaged data rather
+  // than as page 9 of 27.
+  const doc = docOfDrawer[d.id];
+  let partof = "";
+  if(doc){
+    const pos = doc.ids.indexOf(d.id) + 1;
+    partof = `<div class="partof">Chunk <b>${pos}</b> of ${doc.n} from
+      <a data-doc="${esc(doc.key)}">${esc(doc.key)}</a> — open the whole document to read it in order.</div>`;
+  }
   c.innerHTML = `
     <div class="crumb"><a data-back>← back</a> &nbsp;·&nbsp;
       <a data-nav="wing" data-w="${esc(d.wing)}">${esc(d.wing)}</a> /
       <a data-nav="room" data-w="${esc(d.wing)}" data-r="${esc(d.room)}">${esc(d.room)}</a></div>
     <div class="detail"><h2>${esc(d.id)}</h2>
+      ${partof}
       <dl class="metagrid">${rows}<dt>size</dt><dd>${bytes(d.bytes)}</dd></dl>
       <pre class="doc">${hl(d.content, query)}</pre></div>`;
   wireNav(c);
   c.querySelector("[data-back]").onclick = () => render();
+  const dl = c.querySelector("[data-doc]");
+  if(dl) dl.onclick = () => docDetail(doc);
   c.scrollTop = 0;
+}
+
+// ---- documents -------------------------------------------------------------
+// A document is every chunk mined from one source_file, back in order. It is
+// deliberately not part of the tree: chunks are filed by topic, so one file's
+// chunks legitimately land in different rooms.
+function docMatches(doc){
+  if(!query) return true;
+  const q = query.toLowerCase();
+  if(doc.key.toLowerCase().includes(q)) return true;
+  return doc.ids.some(id => byId[id] && byId[id].content.toLowerCase().includes(q));
+}
+
+function renderDocs(){
+  const hits = (DATA.documents || []).filter(docMatches);
+  const c = document.getElementById("content");
+  const loose = DATA.count - (DATA.documents||[]).reduce((a,d)=>a+d.n,0);
+  const crumb = `<div class="crumb">Documents &nbsp;·&nbsp; ${hits.length} of
+    ${(DATA.documents||[]).length}${query?` matching “${esc(query)}”`:""}
+    &nbsp;·&nbsp; <span style="color:var(--fg-subtle)">reassembled from
+    source_file — the remaining ${loose} drawer${loose===1?"":"s"}
+    ${loose===1?"stands":"stand"} alone</span></div>`;
+  if(!hits.length){
+    c.innerHTML = crumb + `<div class="empty">No documents match.</div>`;
+    return;
+  }
+  c.innerHTML = crumb + hits.map((doc, i) => {
+    const first = byId[doc.ids[0]];
+    const prev = first ? first.content.slice(0, 200) : "";
+    const where = doc.rooms.length > 1
+      ? `${doc.wings.join(", ")} · ${doc.rooms.length} rooms`
+      : `${doc.wings.join(", ")} / ${doc.rooms[0]}`;
+    return `<div class="card" data-d="${i}">
+      <div class="top"><span class="loc">${esc(doc.key)}</span>
+        <span class="nchunk">${doc.n} chunks</span>
+        ${doc.issues.length ? '<span class="pill" style="background:var(--warning)">order</span>' : ""}
+        <span class="when">${when(doc.last)}</span></div>
+      <div class="docmeta">${esc(where)} · ${bytes(doc.bytes)}</div>
+      <div class="prev">${hl(prev, query)}</div></div>`;
+  }).join("");
+  c.querySelectorAll(".card").forEach(el =>
+    el.onclick = () => docDetail(hits[+el.dataset.d]));
+  c.scrollTop = 0;
+}
+
+function docDetail(doc){
+  const c = document.getElementById("content");
+  // Chunk seams stay visible. This is verbatim slices shown in order, not a
+  // file we recovered — and each seam is a filing decision the miner made,
+  // which is worth being able to see rather than smoothing away.
+  const body = doc.ids.map((id, i) => {
+    const d = byId[id];
+    if(!d) return "";
+    const ci = d.chunk_index === null || d.chunk_index === undefined ? "—" : d.chunk_index;
+    return `<div class="seam">chunk ${ci} · <span class="rm">${esc(d.wing)}/${esc(d.room)}</span></div>
+            <pre>${hl(d.content, query)}</pre>`;
+  }).join("");
+
+  const warn = doc.issues.length
+    ? `<div class="note"><b>Chunk order is not reliable for this document.</b>
+       ${doc.issues.map(esc).join("; ")}. Shown in the best order available
+       (chunk_index, then filing time) — but MemPalace's own numbering is the
+       problem here, so treat the sequence as a hint.</div>` : "";
+  const spans = doc.rooms.length > 1
+    ? `<div class="note" style="border-left-color:var(--brand);background:rgb(13 107 255 / .07)">
+       This file's chunks are filed across <b>${doc.rooms.length} rooms</b>
+       (${doc.rooms.map(esc).join(", ")}) — the miner working as designed, since
+       rooms are topics and one file covers several. Chunk numbers restart at 0
+       in each room, so this is shown as one run per room, not one sequence.
+       It is also why documents are a separate view rather than a branch of the
+       tree: this file has no single place to live.</div>` : "";
+
+  c.innerHTML = `
+    <div class="crumb"><a data-back>← back</a> &nbsp;·&nbsp; Document</div>
+    <div class="detail"><h2>${esc(doc.key)}</h2>
+      <dl class="metagrid">
+        <dt>chunks</dt><dd>${doc.n}</dd>
+        <dt>wings</dt><dd>${doc.wings.map(esc).join(", ")}</dd>
+        <dt>rooms</dt><dd>${doc.rooms.map(esc).join(", ")}</dd>
+        <dt>filed</dt><dd>${when(doc.first)}${doc.first!==doc.last?" → "+when(doc.last):""}</dd>
+        <dt>size</dt><dd>${bytes(doc.bytes)}</dd></dl>
+      ${warn}${spans}
+      <div class="chunks">${body}</div></div>`;
+  c.querySelector("[data-back]").onclick = () => { render(); };
+  c.scrollTop = 0;
+}
+
+// Everything that could legitimately stop this from being "healthy". Kept in
+// one place because the rule is easy to state and easy to violate piecemeal:
+// never show green while a warning is live. A status light that cannot go
+// amber is decoration, and the palace this was built against had a real
+// warning — no recorded embedder identity — that had been firing to a log
+// nobody reads for months.
+function healthIssues(){
+  const out = [];
+  for(const w of (DATA.palace_notes || [])){
+    out.push({level:"warn", text:w});
+  }
+  const s = DATA.storage || {};
+  if(s.available && s.disk_total){
+    const pct = s.disk_used / s.disk_total * 100;
+    if(pct > 90) out.push({level:"bad", text:`Disk ${pct.toFixed(0)}% full on ${s.mount}.`});
+    else if(pct > 75) out.push({level:"warn", text:`Disk ${pct.toFixed(0)}% full on ${s.mount}.`});
+  }
+  const v = DATA.version || {};
+  if(v.status === "unknown")
+    out.push({level:"warn", text:"Update check failed — could not reach PyPI. "
+              + "The installed version is known; whether it is current is not."});
+  if(v.status === "update-available")
+    out.push({level:"warn", text:`MemPalace ${v.latest} is available (running ${v.installed}).`});
+  const kg = (DATA.layers || {}).kg || {};
+  if(kg.rival)
+    out.push({level:"warn", text:"Two knowledge graphs exist. This browser reads "
+      + kg.path + " (" + (kg.entities||0) + " entities, " + (kg.triples||0)
+      + " triples). An MCP server started with --palace reads " + kg.rival
+      + " instead — so your agents may be querying a different graph than this one."});
+  for(const doc of (DATA.documents || [])){
+    if(doc.issues.length)
+      out.push({level:"warn", text:`Document “${doc.key}”: ${doc.issues.join("; ")}.`});
+  }
+  return out;
 }
 
 function renderChips(){
@@ -892,31 +1556,132 @@ function renderChips(){
   chip.style.display = nu ? "" : "none";
   chip.textContent = nu + " new";
 
+  const issues = healthIssues();
+  const hc = document.getElementById("healthChip");
+  const bad = issues.some(i => i.level === "bad");
+  if(bad){
+    hc.className = "chip act bad"; hc.textContent = "Needs attention";
+  } else if(issues.length){
+    hc.className = "chip act warn";
+    hc.textContent = issues.length === 1 ? "1 warning" : issues.length + " warnings";
+  } else {
+    hc.className = "chip act ok"; hc.textContent = "Healthy";
+  }
+  hc.title = issues.length ? issues.map(i => i.text).join("\n") : "No warnings — click for details";
+
   // Escape these too. They look trustworthy — one is our own package version,
   // the other comes from PyPI over HTTPS — but "the input is probably fine" is
   // not a security control, and esc() is free.
+  // This chip is MemPalace's version, not the browser's. Unlabelled next to a
+  // wordmark reading "MemPalace Browser" it reads as ours, which is the one
+  // number it is not — the browser's own version lives in System status.
   const v = DATA.version, vc = document.getElementById("verChip");
   const inst = esc(v.installed), late = esc(v.latest);
+  const who = `<span class="who">MemPalace</span> <b>${inst}</b>`;
   if(v.status === "current"){
-    vc.className = "chip act current"; vc.innerHTML = `<b>${inst}</b> · up to date`;
+    vc.className = "chip act current"; vc.innerHTML = `${who} · up to date`;
   } else if(v.status === "update-available"){
-    vc.className = "chip act update"; vc.innerHTML = `<b>${inst}</b> → ${late} available`;
+    vc.className = "chip act update"; vc.innerHTML = `${who} → ${late} available`;
   } else if(v.status === "ahead"){
-    vc.className = "chip act"; vc.innerHTML = `<b>${inst}</b> · ahead of PyPI (${late})`;
+    vc.className = "chip act"; vc.innerHTML = `${who} · ahead of PyPI (${late})`;
   } else if(v.status === "checking"){
-    vc.className = "chip act"; vc.innerHTML = `<b>${inst}</b> · checking…`;
+    vc.className = "chip act"; vc.innerHTML = `${who} · checking…`;
   } else if(v.status === "disabled"){
     // We did not look. Say that, rather than implying anything about it.
-    vc.className = "chip"; vc.innerHTML = `<b>${inst}</b> · update check off`;
+    vc.className = "chip"; vc.innerHTML = `${who} · update check off`;
     vc.title = "MPB_CHECK_UPDATES=0 — no outbound requests are made";
   } else {
     // PyPI unreachable. Say so — never imply "current".
-    vc.className = "chip act unknown"; vc.innerHTML = `<b>${inst}</b> · update check failed`;
+    vc.className = "chip act unknown"; vc.innerHTML = `${who} · update check failed`;
     vc.title = v.error || "could not reach PyPI";
   }
 }
 
-function render(){ renderChips(); renderTree(); renderStats(); renderList(); }
+function render(){
+  document.querySelectorAll(".view").forEach(b =>
+    b.classList.toggle("sel", b.dataset.view === view));
+  renderChips(); renderTree(); renderStats();
+  if(view === "documents") renderDocs(); else renderList();
+}
+
+// ---- overlays --------------------------------------------------------------
+function sheet(html){
+  document.getElementById("sheet").innerHTML =
+    `<button class="close" data-x>Close</button>` + html;
+  const o = document.getElementById("overlay");
+  o.hidden = false;
+  document.querySelector("[data-x]").onclick = closeSheet;
+}
+function closeSheet(){ document.getElementById("overlay").hidden = true; }
+document.addEventListener("keydown", e => { if(e.key === "Escape") closeSheet(); });
+
+function systemSheet(){
+  const issues = healthIssues();
+  const v = DATA.version || {}, s = DATA.storage || {};
+  const state = issues.some(i=>i.level==="bad") ? "Needs attention"
+              : issues.length ? "Warnings present" : "Healthy";
+  const notes = issues.length
+    ? issues.map(i => `<div class="note ${i.level==="bad"?"bad":""}">${esc(i.text)}</div>`).join("")
+    : `<div class="sub" style="margin:0">Nothing to report.</div>`;
+  sheet(`
+    <h2>System status — ${esc(state)}</h2>
+    <p class="sub">What this deployment is reading, and anything wrong with it.</p>
+    <h3>Warnings</h3>${notes}
+    <h3>Palace</h3>
+    <dl class="kv">
+      <dt>Path</dt><dd>${esc(DATA.palace_path)}</dd>
+      <dt>Backend</dt><dd>${esc(s.backend || "—")}</dd>
+      <dt>Drawers</dt><dd>${DATA.count}</dd>
+      <dt>Documents</dt><dd>${(DATA.documents||[]).length} reassembled from source_file</dd>
+      <dt>Read at</dt><dd>${esc(DATA.read_at || "—")} (${ago(DATA.read_at)})</dd>
+      <dt>MemPalace</dt><dd>${esc(v.installed || "—")}${
+        v.status==="current" ? " (current)" :
+        v.status==="update-available" ? " → " + esc(v.latest) + " available" :
+        v.status==="disabled" ? " (update check off)" : " (update check failed)"}
+        · <a href="${MP_REPO}" target="_blank" rel="noopener noreferrer"
+             style="color:var(--brand)">project ↗</a></dd>
+      <dt>This browser</dt><dd>MemPalace Browser ${esc(DATA.mpb_version || "—")} — unofficial,
+        not affiliated with the MemPalace project${DATA.repo_url
+          ? ` · <a href="${esc(DATA.repo_url)}" target="_blank" rel="noopener noreferrer"
+                 style="color:var(--brand)">source ↗</a>` : ""}</dd>
+      <dt>Browser mode</dt><dd>read-only — every collection is opened create=False</dd>
+    </dl>
+    <h3>Storage</h3>
+    <dl class="kv">${ s.available
+      ? `<dt>Palace</dt><dd>${bytes(s.palace_bytes)}</dd>
+         <dt>All data</dt><dd>${bytes(s.data_bytes)}</dd>
+         <dt>Volume</dt><dd>${esc(s.mount)} — ${bytes(s.disk_free)} free${
+            s.dedicated ? " (dedicated)" : " (shared with the OS)"}</dd>`
+      : `<dt>Storage</dt><dd>${esc(s.reason||"n/a")}</dd>` }</dl>`);
+}
+
+// Shown once, unprompted, on a first visit. The vocabulary is the single
+// biggest barrier for anyone who has not read MemPalace's docs — and the
+// metaphor actively misleads: "palace" and "wing" make people go looking for
+// hallways and closets as places you can walk into. They are not. Saying so up
+// front costs four lines.
+function vocabSheet(){
+  sheet(`
+    <h2>New to MemPalace?</h2>
+    <p class="sub">Four words, and one thing the metaphor gets wrong.</p>
+    <div class="vocab">
+      <p><b>Wing</b> — a person or a project. The top level.</p>
+      <p><b>Room</b> — a topic inside a wing.</p>
+      <p><b>Drawer</b> — the memory itself: a slice of text, stored word for word.
+         MemPalace never summarises or rewrites; a drawer is what was actually said.</p>
+      <p><b>Document</b> — a browser feature, not a MemPalace one. Long files get
+         split into many drawers, so a drawer often starts mid-sentence. The
+         Documents view puts them back in order.</p>
+      <p style="color:var(--fg-subtle);border-top:1px solid var(--line);padding-top:10px">
+         The building is a naming convention, not a structure — there is no floor
+         above a wing and nothing inside a drawer. Wings and rooms are labels the
+         search filters on. Closets, halls and tunnels exist, but they point at
+         drawers rather than contain them, and in most palaces they are empty.
+         The <b>Layers</b> panel shows exactly how full yours are.</p>
+      <p style="color:var(--fg-subtle)">This browser only reads. Nothing you click
+         changes your palace.</p>
+    </div>`);
+}
 
 async function load(force){
   const btn = document.getElementById("btnRefresh");
@@ -926,7 +1691,13 @@ async function load(force){
     if(!r.ok) throw new Error("HTTP " + r.status);
     const d = await r.json();
     DATA = d; readAt = d.read_at;
-    document.getElementById("palacePath").textContent = d.palace_path;
+
+    // Index once per load, not once per render.
+    byId = {}; docOfDrawer = {};
+    for(const dr of d.drawers) byId[dr.id] = dr;
+    for(const doc of (d.documents || [])) for(const id of doc.ids) docOfDrawer[id] = doc;
+    document.getElementById("vnDrawers").textContent = d.count;
+    document.getElementById("vnDocs").textContent = (d.documents || []).length;
 
     const stored = localStorage.getItem(LS_KEY);
     if(stored === null){
@@ -956,6 +1727,14 @@ document.getElementById("q").addEventListener("input", e => {
   query = e.target.value.trim(); render();
 });
 document.getElementById("btnRefresh").onclick = () => load(true);
+document.querySelectorAll(".view").forEach(b => b.onclick = () => {
+  view = b.dataset.view; render();
+});
+document.getElementById("healthChip").onclick = systemSheet;
+document.getElementById("helpChip").onclick = vocabSheet;
+document.getElementById("overlay").onclick = e => {
+  if(e.target.id === "overlay") closeSheet();   // click the backdrop, not the sheet
+};
 document.getElementById("verChip").onclick = async () => {
   const vc = document.getElementById("verChip");
   vc.textContent = "checking…";
@@ -964,7 +1743,16 @@ document.getElementById("verChip").onclick = async () => {
   } catch(e){ /* renderChips will show the failed state */ }
   renderChips();
 };
-load(false);
+
+const INTRO_KEY = "mpb.seenIntro";
+load(false).then(() => {
+  // First visit only, and only once the palace actually loaded — an intro over
+  // a failed load explains vocabulary to someone staring at an error.
+  if(DATA && !localStorage.getItem(INTRO_KEY)){
+    localStorage.setItem(INTRO_KEY, "1");
+    vocabSheet();
+  }
+});
 </script>
 </body>
 </html>

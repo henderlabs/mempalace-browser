@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="HenderLabs">
+  <rect width="64" height="64" rx="14" fill="#050B14"/>
+  <g stroke-linejoin="round" stroke-linecap="round" fill="none">
+    <!-- Painted bottom-to-top. Each upper layer first lays down a tile-coloured
+         halo, which carves the dark gap that separates it from the layer below. -->
+    <path d="M12 39 L32 50 L52 39" stroke="#FFFFFF" stroke-width="6"/>
+
+    <path d="M12 31 L32 42 L52 31" stroke="#050B14" stroke-width="13"/>
+    <path d="M12 31 L32 42 L52 31" stroke="#6E7886" stroke-width="6"/>
+
+    <path d="M32 11 L52 22 L32 33 L12 22 Z" stroke="#050B14" stroke-width="10"/>
+    <path d="M32 11 L52 22 L32 33 L12 22 Z" fill="#0D6BFF" stroke="#0D6BFF" stroke-width="4"/>
+  </g>
+</svg>
