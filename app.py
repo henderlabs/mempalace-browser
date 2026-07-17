@@ -81,6 +81,24 @@ def _build_id():
 
 BUILD_ID = _build_id()
 
+
+def _upgrade_hint():
+    """The upgrade command that fits how MemPalace was actually installed.
+
+    Guessing wrong here is worse than staying quiet: `pip install -U` inside a
+    uv tool environment is how people break a working install. The interpreter
+    path is evidence — run.sh found it by following the `mempalace` console
+    script's shebang, so it names the environment MemPalace really lives in.
+    """
+    p = (sys.executable or "").replace("\\", "/")
+    if "/uv/tools/" in p:
+        return "uv tool upgrade mempalace"
+    if "/pipx/" in p:
+        return "pipx upgrade mempalace"
+    if "/venv" in p or "/.venv" in p:
+        return "pip install -U mempalace   # inside the venv MemPalace lives in"
+    return "pip install -U mempalace"
+
 # The HenderLabs mark — three layers, painted bottom to top. Inlined rather
 # than read from assets/ because this program is one file with no static dir,
 # and a favicon that 404s is worse than none.
@@ -117,6 +135,12 @@ PYPI_URL = "https://pypi.org/pypi/mempalace/json"
 # README screenshot contains nobody's real life, and so the tests can exercise
 # the whole server without installing a vector database in CI.
 DEMO = os.environ.get("MPB_DEMO") == "1"
+
+# Host CPU/RAM. Off by default: on a box dedicated to MemPalace these are the
+# most useful numbers here, and on a shared box they describe everything except
+# your palace. Only the operator knows which they run, so it is a switch rather
+# than a guess. MPB_RESOURCES=1 to enable.
+RESOURCES = os.environ.get("MPB_RESOURCES", "1" if os.environ.get("MPB_DEMO") == "1" else "0") == "1"
 
 # The only outbound request this program ever makes is the PyPI version check,
 # and it is disclosed in the README. It sends no palace data — it fetches a
@@ -237,6 +261,53 @@ def _dir_size(path):
             except OSError:
                 pass
     return total, files
+
+
+def resource_info():
+    """Host CPU load and memory, when the operator asks for them.
+
+    Off by default, MPB_RESOURCES=1 to enable. Whether these numbers mean
+    anything depends entirely on the deployment: on a box dedicated to
+    MemPalace they are the most useful figures on the page, because the
+    embedder loads a model into RAM and Chroma keeps its HNSW index there —
+    RAM is what runs out before disk does as a palace grows. On a shared box
+    they describe everything except your palace. Only the operator knows which
+    they have, so it is their switch, not our guess.
+
+    Reported as the HOST, never as MemPalace. Attributing RSS to MemPalace
+    would mean hunting processes and guessing which is which; "this machine is
+    using 2.1 of 3.8 GB" is true, "MemPalace is using 2.1 GB" would not be.
+
+    Linux only — /proc is the whole implementation, and there is no stdlib way
+    to do this portably. Elsewhere it reports unavailable rather than zero.
+    """
+    if not RESOURCES:
+        return {"enabled": False}
+    if DEMO:
+        return {"enabled": True, "available": True, "mem_total": 4_007_657_472,
+                "mem_used": 1_331_691_520, "mem_avail": 2_675_965_952,
+                "load1": 0.14, "cpus": 2, "swap_total": 0, "swap_used": 0}
+    try:
+        mem = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, _, v = line.partition(":")
+                mem[k.strip()] = int(v.strip().split()[0]) * 1024   # kB -> bytes
+        total = mem.get("MemTotal", 0)
+        avail = mem.get("MemAvailable", 0)
+        swt = mem.get("SwapTotal", 0)
+        with open("/proc/loadavg") as fh:
+            load1 = float(fh.read().split()[0])
+        return {
+            "enabled": True, "available": True,
+            "mem_total": total, "mem_avail": avail, "mem_used": total - avail,
+            "swap_total": swt, "swap_used": swt - mem.get("SwapFree", 0),
+            "load1": load1, "cpus": os.cpu_count() or 1,
+        }
+    except (OSError, ValueError, IndexError) as e:
+        # No /proc, or a shape we do not recognise. Unavailable is a fact.
+        return {"enabled": True, "available": False,
+                "reason": f"host metrics unavailable on this platform ({type(e).__name__})"}
 
 
 def _mount_of(path):
@@ -577,12 +648,14 @@ def read_palace(force=False):
                 "palace_path": PALACE_PATH,
                 "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
                 "storage": storage_info(),
+                "resources": resource_info(),
                 "documents": build_documents(drawers),
                 "layers": _layer_counts(drawers),
                 "palace_notes": [],
                 "mpb_version": MPB_VERSION,
                 "build_id": BUILD_ID,
                 "repo_url": REPO_URL,
+                "upgrade_cmd": _upgrade_hint(),
                 "demo": True,
             }
             _palace_cache.update(at=now, data=data)
@@ -636,12 +709,14 @@ def read_palace(force=False):
             "palace_path": PALACE_PATH,
             "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
             "storage": storage_info(),
+            "resources": resource_info(),
             "documents": build_documents(drawers),
             "layers": _layer_counts(drawers),
             "palace_notes": list(_palace_notes_seen),
             "mpb_version": MPB_VERSION,
             "build_id": BUILD_ID,
             "repo_url": REPO_URL,
+            "upgrade_cmd": _upgrade_hint(),
         }
         _palace_cache.update(at=now, data=data)
         return data
@@ -924,6 +999,30 @@ INDEX_HTML = r"""<!doctype html>
                   background:var(--surface-raised); color:var(--fg-muted);
                   border-radius:6px; font:inherit; font-size:12px; padding:3px 9px; }
   .sheet .close:hover { border-color:var(--brand); color:var(--fg); }
+  /* Advisories: a warning plus something you can act on. */
+  .adv { border:1px solid var(--line-2); border-left:2px solid var(--warning);
+         border-radius:0 8px 8px 0; padding:11px 13px; margin:8px 0;
+         background:rgb(245 158 11 / .05); }
+  .adv.bad { border-left-color:var(--error); background:rgb(239 68 68 / .06); }
+  .adv-t { font-size:12.5px; font-weight:600; color:var(--fg); margin-bottom:5px; }
+  .adv-w { font-size:12px; color:var(--fg-muted); line-height:1.55; }
+  .fx { margin-top:9px; }
+  .fx-h { font-size:11px; font-weight:600; color:var(--brand); margin-bottom:4px; }
+  .fx-c { background:var(--bg); border:1px solid var(--line); border-radius:6px;
+          padding:8px 10px; margin:0; font-family:var(--mono); font-size:11px;
+          line-height:1.55; color:var(--fg-muted); white-space:pre-wrap;
+          word-break:break-word; overflow-x:auto; }
+  .fx-n { font-size:11px; color:var(--fg-subtle); margin-top:4px; line-height:1.5; }
+  .fx-u { font-size:11px; color:var(--warning); margin-top:9px; line-height:1.5;
+          border-top:1px dashed var(--line-2); padding-top:8px; }
+  .fx-m { margin-top:9px; font-size:11px; color:var(--fg-subtle); }
+  .fx-m b { color:var(--fg-muted); display:block; margin-bottom:3px; font-size:11px; }
+  .fx-b { margin-top:10px; cursor:pointer; font:inherit; font-size:11px; padding:4px 10px;
+          border-radius:6px; border:1px solid var(--line-2); background:var(--surface-raised);
+          color:var(--fg-muted); }
+  .fx-b:hover { border-color:var(--brand); color:var(--fg); }
+  .fx-b:focus-visible { outline:none; box-shadow:var(--shadow-brand); }
+
   .note { border-left:2px solid var(--warning); background:rgb(245 158 11 / .07);
           padding:9px 12px; margin:8px 0; font-size:12.5px; color:var(--fg-muted);
           border-radius:0 6px 6px 0; }
@@ -1309,7 +1408,7 @@ function renderStats(){
   const max = Math.max(1, ...keys.map(k => counts[k]));
   const mlab = k => new Date(k+"-01").toLocaleDateString(undefined,{month:"short"});
 
-  document.getElementById("info").innerHTML = storeHtml + `
+  document.getElementById("info").innerHTML = storeHtml + resourcesHtml() + `
     <div class="st-h" style="margin-top:13px">Drawers filed · 12mo</div>
     <div class="spark">${keys.map(k =>
       `<i class="${counts[k]?"has":""}" style="height:${counts[k]? Math.max(8,counts[k]/max*100):2}%"
@@ -1355,6 +1454,27 @@ function aboutHtml(){
 // graph answers a query with count:0, which reads as "no such facts" rather
 // than "no such layer". This panel is the difference between those two, and it
 // is the reason a coverage number appears next to every row instead of a tick.
+// Host figures, labelled as the host. Hidden entirely unless asked for.
+function resourcesHtml(){
+  const r = DATA.resources || {};
+  if(!r.enabled) return "";
+  if(!r.available)
+    return `<div class="st-h" style="margin-top:13px">Host</div>
+            <div class="st-note" style="color:var(--fg-subtle)">${esc(r.reason||"unavailable")}</div>`;
+  const pct = r.mem_total ? (r.mem_used / r.mem_total * 100) : 0;
+  const cls = pct > 90 ? "bad" : pct > 75 ? "warn" : "";
+  const lpc = Math.min(100, (r.load1 / (r.cpus||1)) * 100);
+  const lcls = lpc > 100 ? "bad" : lpc > 70 ? "warn" : "";
+  return `<div class="st-h" style="margin-top:13px">Host</div>
+    <div class="st-row"><span>Memory</span><span>${bytes(r.mem_used)} / ${bytes(r.mem_total)}</span></div>
+    <div class="bar ${cls}"><i style="width:${Math.max(0.6,pct).toFixed(1)}%"></i></div>
+    <div class="st-row"><span>Available</span><span>${bytes(r.mem_avail)}</span></div>
+    ${r.swap_total ? `<div class="st-row"><span>Swap</span><span>${bytes(r.swap_used)} / ${bytes(r.swap_total)}</span></div>` : ""}
+    <div class="st-row" style="margin-top:5px"><span>Load (1m)</span><span>${r.load1.toFixed(2)} / ${r.cpus} cpu</span></div>
+    <div class="bar ${lcls}"><i style="width:${Math.max(0.6,lpc).toFixed(1)}%"></i></div>
+    <div class="st-note">this machine, not MemPalace — the embedder and the vector index live in RAM</div>`;
+}
+
 function layersHtml(){
   const L = DATA.layers || {};
   const total = DATA.count || 1;
@@ -1548,38 +1668,124 @@ function docDetail(doc){
   c.scrollTop = 0;
 }
 
-// Everything that could legitimately stop this from being "healthy". Kept in
-// one place because the rule is easy to state and easy to violate piecemeal:
-// never show green while a warning is live. A status light that cannot go
-// amber is decoration, and the palace this was built against had a real
-// warning — no recorded embedder identity — that had been firing to a log
-// nobody reads for months.
+// Everything that could legitimately stop this from being "healthy", each with
+// a fix a person -- or their agent -- can actually act on.
+//
+// This program does not apply fixes and must not. It is read-only by
+// construction, and it answers on 0.0.0.0 with no authentication: a "Fix it"
+// button here would be unauthenticated remote command execution on the machine
+// holding your memory. Diagnosing is our job; acting is the operator's, or the
+// agent they prompt with it. MemPalace is a tool for agents -- handing one an
+// accurate diagnosis IS the actuator.
+//
+// Every advisory carries verify and undo, not just a command. A warning that
+// says "run this" without telling you how to check it worked or how to back it
+// out is asking a stranger to trust us blindly.
+//
+// Where two fixes are legitimate, both are shown with the tradeoff stated. The
+// knowledge-graph split has exactly this shape, and picking for the operator
+// would have been wrong -- symlink and move are both correct, for different
+// deployments.
 function healthIssues(){
   const out = [];
+  const L = DATA.layers || {}, kg = L.kg || {}, s = DATA.storage || {}, v = DATA.version || {};
+
   for(const w of (DATA.palace_notes || [])){
-    out.push({level:"warn", text:w});
+    if(/embedder identity/i.test(w)){
+      out.push({level:"warn",
+        title:"Embedder identity is not recorded on this palace",
+        why:"MemPalace is assuming the current model. Nothing is wrong today, but if the "
+           +"default embedder ever changes, new drawers get embedded into a different vector "
+           +"space than the ones already filed. Semantic search does not error on that — it "
+           +"quietly returns worse answers. Recording the identity now pins it.",
+        fixes:[{label:"Record the identity", cmd:"mempalace palace set-embedder --model minilm"}],
+        verify:"Restart the browser. This warning should be gone and System status should read "
+              +"0 warnings. (The warning is raised once per process, so it cannot clear itself "
+              +"without a restart.)",
+        undo:"Re-run with --force and a different --model to change it. It writes palace "
+            +"metadata only; drawers and embeddings are untouched."});
+    } else {
+      out.push({level:"warn", title:"MemPalace reported a warning about this palace", why:w});
+    }
   }
-  const s = DATA.storage || {};
+
+  if(kg.rival){
+    out.push({level:"warn",
+      title:"Two knowledge graphs — your agents may be reading the empty one",
+      why:`This browser reads ${kg.path} (${kg.entities||0} entities, ${kg.triples||0} triples). `
+         +`An MCP server started with --palace reads ${kg.rival} instead. mcp_server._resolve_kg_path() `
+         +`returns <palace_path>/knowledge_graph.sqlite3 when --palace was passed and the library `
+         +`default otherwise — different files even when --palace names the default path. `
+         +`KnowledgeGraph() creates a missing file rather than failing, so the losing side answers `
+         +`kg_query with a confident count:0 about facts that exist. Note --palace is a REQUIRED `
+         +`argument to 'daemon serve', so it cannot simply be dropped.`,
+      fixes:[
+        {label:"A. Symlink (nothing moves; recommended)",
+         cmd:`# stop the MCP daemon AND this browser first — swapping a file under a\n`
+            +`# process that holds it open leaves it reading the old inode.\n`
+            +`mv ${kg.rival} ${kg.rival}.empty.bak\n`
+            +`rm -f ${kg.rival}-wal ${kg.rival}-shm\n`
+            +`ln -s ${kg.path} ${kg.rival}`,
+         note:"Safe: SQLite resolves the link and keeps -wal/-shm beside the real file, so both "
+             +"names are one database with one WAL."},
+        {label:"B. Move the real graph to where the daemon looks",
+         cmd:`# stop the MCP daemon AND this browser first.\n`
+            +`mv ${kg.rival} ${kg.rival}.empty.bak\n`
+            +`mv ${kg.path} ${kg.rival}\n`
+            +`ln -s ${kg.rival} ${kg.path}`,
+         note:"Prefer this if the daemon is the only writer and you want the real file living in "
+             +"the palace directory. Same end state, opposite direction."}],
+      verify:`readlink -f ${kg.rival}\n# must resolve to ${kg.path}\n`
+            +`# then restart both and confirm kg_stats reports the real counts.`,
+      undo:`rm ${kg.rival} && mv ${kg.rival}.empty.bak ${kg.rival}`});
+  }
+
   if(s.available && s.disk_total){
     const pct = s.disk_used / s.disk_total * 100;
-    if(pct > 90) out.push({level:"bad", text:`Disk ${pct.toFixed(0)}% full on ${s.mount}.`});
-    else if(pct > 75) out.push({level:"warn", text:`Disk ${pct.toFixed(0)}% full on ${s.mount}.`});
+    if(pct > 75) out.push({level: pct > 90 ? "bad" : "warn",
+      title:`Disk ${pct.toFixed(0)}% full on ${s.mount}`,
+      why:s.dedicated ? "This volume is dedicated to MemPalace, so it is your palace that runs out."
+                      : "This volume is shared with the OS — your palace is competing with everything "
+                       +"else on the machine for what is left.",
+      fixes:[{label:"Free space or grow the volume", cmd:`du -sh ${s.data_path||s.mount}/* | sort -h | tail`}],
+      verify:"Reload this page; the storage bar should drop below 75%.",
+      undo:"n/a — nothing here is destructive."});
   }
-  const v = DATA.version || {};
+
   if(v.status === "unknown")
-    out.push({level:"warn", text:"Update check failed — could not reach PyPI. "
-              + "The installed version is known; whether it is current is not."});
+    out.push({level:"warn", title:"Update check failed — could not reach PyPI",
+      why:"The installed version is known; whether it is current is not. This is a network fact, "
+         +"not a palace fact. Said out loud rather than shown as 'up to date', which would be a guess.",
+      fixes:[{label:"Silence the check (makes this program fully offline)", cmd:"MPB_CHECK_UPDATES=0 ./run.sh"}],
+      verify:"The version chip should read 'update check off' rather than 'update check failed'.",
+      undo:"Unset MPB_CHECK_UPDATES."});
+
   if(v.status === "update-available")
-    out.push({level:"warn", text:`MemPalace ${v.latest} is available (running ${v.installed}).`});
-  const kg = (DATA.layers || {}).kg || {};
-  if(kg.rival)
-    out.push({level:"warn", text:"Two knowledge graphs exist. This browser reads "
-      + kg.path + " (" + (kg.entities||0) + " entities, " + (kg.triples||0)
-      + " triples). An MCP server started with --palace reads " + kg.rival
-      + " instead — so your agents may be querying a different graph than this one."});
+    out.push({level:"warn", title:`MemPalace ${v.latest} is available (running ${v.installed})`,
+      why:"Informational. Upgrading MemPalace can change the palace format — 'mempalace migrate' "
+         +"exists precisely because that schema moves. Read their changelog first.",
+      fixes:[{label:"Upgrade (matched to how MemPalace is installed here)", cmd:DATA.upgrade_cmd || "pip install -U mempalace"}],
+      verify:"Restart this browser; the version chip should read 'up to date'.",
+      undo:"Reinstall the previous version with the same tool."});
+
   for(const doc of (DATA.documents || [])){
-    if(doc.issues.length)
-      out.push({level:"warn", text:`Document “${doc.key}”: ${doc.issues.join("; ")}.`});
+    if(!doc.issues.length) continue;
+    out.push({level:"warn",
+      title:`Document filed more than once: ${doc.key}`,
+      why:`${doc.issues.join("; ")}. The same source was mined more than once without purging the `
+         +`earlier drawers, so the palace holds two copies of this content and a search will return `
+         +`both. chunk_index is scoped per (source_file, room), so this is counted per room — a file `
+         +`spanning several rooms is not itself a fault.`,
+      // Deliberately no command. A re-mine's purge semantics for DRAWERS (as opposed to closets,
+      // which CLOSETS.md documents as purged per source_file) are not established, and
+      // delete_by_source may be the cleaner path. An unverified fix is worse than none: this is a
+      // diagnosis, and it says so.
+      fixes:[],
+      unverified:"No verified fix yet. `mempalace_delete_by_source` followed by a re-mine is the "
+                +"likely path, but whether a re-mine purges prior drawers has not been confirmed — "
+                +"so no command is offered here rather than one that might delete the wrong thing.",
+      verify:"After any fix, this warning should disappear on reload.",
+      undo:"Back up the palace before deleting drawers."});
   }
   return out;
 }
@@ -1608,7 +1814,7 @@ function renderChips(){
   } else {
     hc.className = "chip act ok"; hc.textContent = "Healthy · 0 warnings";
   }
-  hc.title = n ? issues.map(i => "• " + i.text).join("\n")
+  hc.title = n ? issues.map(i => "• " + i.title).join("\n")
               : "Checked: embedder identity, knowledge-graph split, disk, "
                 + "update check, document chunk ordering. Nothing to report.";
 
@@ -1664,11 +1870,13 @@ function systemSheet(){
   const state = issues.some(i=>i.level==="bad") ? "Needs attention"
               : issues.length ? "Warnings present" : "Healthy";
   const notes = issues.length
-    ? issues.map(i => `<div class="note ${i.level==="bad"?"bad":""}">${esc(i.text)}</div>`).join("")
+    ? issues.map((i, n) => advisoryHtml(i, n)).join("")
     : `<div class="sub" style="margin:0">Nothing to report.</div>`;
   sheet(`
     <h2>System status — ${esc(state)}</h2>
-    <p class="sub">What this deployment is reading, and anything wrong with it.</p>
+    <p class="sub">What this deployment is reading, and anything wrong with it.
+      This browser only reads — it never applies a fix. Every advisory below is
+      something you (or an agent you hand it to) can run.</p>
     <h3>Warnings (${issues.length})</h3>${notes}
     <p class="sub" style="margin:8px 0 0;font-size:11px">Checked every read:
       embedder identity · knowledge-graph split · disk headroom · update check ·
@@ -1687,8 +1895,7 @@ function systemSheet(){
         · <a href="${MP_REPO}" target="_blank" rel="noopener noreferrer"
              style="color:var(--brand)">project ↗</a></dd>
       <dt>This browser</dt><dd>MemPalace Browser ${esc(DATA.mpb_version || "—")} · build
-        ${esc(DATA.build_id || "—")} — unofficial,
-        not affiliated with the MemPalace project${DATA.repo_url
+        ${esc(DATA.build_id || "—")} — unofficial, not affiliated with the MemPalace project${DATA.repo_url
           ? ` · <a href="${esc(DATA.repo_url)}" target="_blank" rel="noopener noreferrer"
                  style="color:var(--brand)">source ↗</a>` : ""}</dd>
       <dt>Browser mode</dt><dd>read-only — every collection is opened create=False</dd>
@@ -1700,6 +1907,84 @@ function systemSheet(){
          <dt>Volume</dt><dd>${esc(s.mount)} — ${bytes(s.disk_free)} free${
             s.dedicated ? " (dedicated)" : " (shared with the OS)"}</dd>`
       : `<dt>Storage</dt><dd>${esc(s.reason||"n/a")}</dd>` }</dl>`);
+  wireAdvisories(issues);
+}
+
+function advisoryHtml(i, n){
+  const fixes = (i.fixes || []).map(f => `
+    <div class="fx">
+      <div class="fx-h">${esc(f.label)}</div>
+      <pre class="fx-c">${esc(f.cmd)}</pre>
+      ${f.note ? `<div class="fx-n">${esc(f.note)}</div>` : ""}
+    </div>`).join("");
+  const unver = i.unverified ? `<div class="fx-u">${esc(i.unverified)}</div>` : "";
+  return `<div class="adv ${i.level==="bad"?"bad":""}">
+    <div class="adv-t">${esc(i.title)}</div>
+    <div class="adv-w">${esc(i.why)}</div>
+    ${fixes}${unver}
+    ${i.verify ? `<div class="fx-m"><b>Verify</b><pre class="fx-c">${esc(i.verify)}</pre></div>` : ""}
+    ${i.undo ? `<div class="fx-m"><b>Undo</b><div class="fx-n">${esc(i.undo)}</div></div>` : ""}
+    <button class="fx-b" data-adv="${n}">Copy for your agent</button>
+  </div>`;
+}
+
+// Hands an agent the whole advisory -- diagnosis, commands, verification,
+// rollback -- as one self-contained prompt. This is the actuator: the browser
+// stays read-only and the agent does the work.
+//
+// Values that came from the palace (a source_file, say) are quoted as data and
+// never interpolated into command position. A source_file is written by
+// whatever mined the drawer, which makes it untrusted input; a fix prompt that
+// splices it into a shell line is a prompt-injection vector aimed at the very
+// agent being asked to run it.
+function advisoryPrompt(i){
+  const L = [];
+  L.push("A read-only MemPalace Browser health check on my palace reports this. Please fix it.");
+  L.push("");
+  L.push("PALACE: " + (DATA.palace_path || "unknown"));
+  L.push("REPORTED BY: MemPalace Browser " + (DATA.mpb_version||"") + " build " + (DATA.build_id||""));
+  L.push("");
+  L.push("WARNING: " + i.title);
+  L.push("");
+  L.push("WHY IT MATTERS:");
+  L.push(i.why);
+  if((i.fixes||[]).length){
+    L.push("");
+    L.push((i.fixes.length > 1)
+      ? "PROPOSED FIXES (more than one is valid — ask me which I want before running anything):"
+      : "PROPOSED FIX:");
+    i.fixes.forEach(f => {
+      L.push("");
+      L.push("--- " + f.label);
+      L.push(f.cmd);
+      if(f.note) L.push("(" + f.note + ")");
+    });
+  }
+  if(i.unverified){ L.push(""); L.push("NOTE: " + i.unverified); }
+  if(i.verify){ L.push(""); L.push("VERIFY IT WORKED:"); L.push(i.verify); }
+  if(i.undo){ L.push(""); L.push("ROLLBACK:"); L.push(i.undo); }
+  L.push("");
+  L.push("Please confirm the diagnosis against the machine before changing anything, "
+       + "and tell me what you are going to run before you run it.");
+  return L.join("\n");
+}
+
+function wireAdvisories(issues){
+  document.querySelectorAll("[data-adv]").forEach(b => {
+    b.onclick = async () => {
+      const txt = advisoryPrompt(issues[+b.dataset.adv]);
+      try { await navigator.clipboard.writeText(txt); b.textContent = "Copied ✓"; }
+      catch(e){
+        // Clipboard needs a secure context; over plain http on a LAN name it is
+        // unavailable. Say so and show the text rather than failing silently.
+        b.textContent = "Select and copy ↓";
+        const pre = document.createElement("pre");
+        pre.className = "fx-c"; pre.style.marginTop = "6px"; pre.textContent = txt;
+        b.after(pre);
+      }
+      setTimeout(() => { if(b.textContent === "Copied ✓") b.textContent = "Copy for your agent"; }, 1600);
+    };
+  });
 }
 
 // Shown once, unprompted, on a first visit. The vocabulary is the single
