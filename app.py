@@ -541,21 +541,25 @@ def _layer_counts(drawers):
     # otherwise. Those are different files even when --palace names the default
     # path, so an agent and this browser can read the same palace and give
     # different answers about its graph. KnowledgeGraph() creates a missing file
-    # rather than failing, so the losing side reports a confident zero instead
-    # of an error. A count without its path is not an answer.
+    # rather than failing, so we must check existence BEFORE instantiating —
+    # otherwise a read-only browser silently creates an empty DB. A count
+    # without its path is not an answer.
     try:
         from mempalace.knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH
-        kg = KnowledgeGraph()
-        try:
-            s = kg.stats() or {}
-            out["kg"] = {"entities": s.get("entities", 0),
-                         "triples": s.get("triples", 0),
-                         "path": DEFAULT_KG_PATH}
-        finally:
-            kg.close()
+        if not os.path.exists(DEFAULT_KG_PATH):
+            out["kg"] = {"error": "not found", "path": DEFAULT_KG_PATH}
+        else:
+            kg = KnowledgeGraph()
+            try:
+                s = kg.stats() or {}
+                out["kg"] = {"entities": s.get("entities", 0),
+                             "triples": s.get("triples", 0),
+                             "path": DEFAULT_KG_PATH}
+            finally:
+                kg.close()
         alt = os.path.join(PALACE_PATH, "knowledge_graph.sqlite3")
         if os.path.realpath(alt) != os.path.realpath(DEFAULT_KG_PATH) and os.path.exists(alt):
-            out["kg"]["rival"] = alt
+            out["kg"].setdefault("rival", alt)
     except Exception as e:
         out["kg"] = {"error": str(e)[:80]}
 
@@ -739,20 +743,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _parse_host_name(host):
+        """Extract the hostname from a Host header, stripping any port.
+
+        Bracketed IPv6 ``[::1]:8080`` → ``::1``.
+        Unbracketed IPv6 ``::1`` (multiple colons, no brackets) → ``::1``.
+        Plain ``host:port`` → ``host``.
+        """
+        if host.startswith("["):
+            return host.partition("]")[0].lstrip("[")
+        if host.count(":") > 1:
+            return host
+        return host.rsplit(":", 1)[0] if ":" in host else host
+
     def _host_allowed(self):
         """Reject requests whose Host we do not recognise (DNS rebinding)."""
         host = (self.headers.get("Host") or "").strip().lower()
-        # Strip the port, being careful with bracketed IPv6 literals.
-        if host.startswith("["):
-            name = host.partition("]")[0].lstrip("[")
-        else:
-            name = host.rsplit(":", 1)[0] if ":" in host else host
-        return name in ALLOWED_HOSTS
+        return self._parse_host_name(host) in ALLOWED_HOSTS
 
     def _refuse_host(self, path):
         """Explain the refusal in the medium the caller is actually using."""
         host = self.headers.get("Host", "(none)")
-        name = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
+        name = self._parse_host_name(host)
         # Route through log_message rather than sys.stderr directly, so there is
         # one logging path and callers can silence it.
         self.log_message("refused Host %r — not allowed. If this is you: "
@@ -1692,6 +1705,8 @@ function docDetail(doc){
 // knowledge-graph split has exactly this shape, and picking for the operator
 // would have been wrong -- symlink and move are both correct, for different
 // deployments.
+function shq(s){ return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+
 function healthIssues(){
   const out = [];
   const L = DATA.layers || {}, kg = L.kg || {}, s = DATA.storage || {}, v = DATA.version || {};
@@ -1729,21 +1744,21 @@ function healthIssues(){
         {label:"A. Symlink (nothing moves; recommended)",
          cmd:`# stop the MCP daemon AND this browser first — swapping a file under a\n`
             +`# process that holds it open leaves it reading the old inode.\n`
-            +`mv ${kg.rival} ${kg.rival}.empty.bak\n`
-            +`rm -f ${kg.rival}-wal ${kg.rival}-shm\n`
-            +`ln -s ${kg.path} ${kg.rival}`,
+            +`mv ${shq(kg.rival)} ${shq(kg.rival+'.empty.bak')}\n`
+            +`rm -f ${shq(kg.rival+'-wal')} ${shq(kg.rival+'-shm')}\n`
+            +`ln -s ${shq(kg.path)} ${shq(kg.rival)}`,
          note:"Safe: SQLite resolves the link and keeps -wal/-shm beside the real file, so both "
              +"names are one database with one WAL."},
         {label:"B. Move the real graph to where the daemon looks",
          cmd:`# stop the MCP daemon AND this browser first.\n`
-            +`mv ${kg.rival} ${kg.rival}.empty.bak\n`
-            +`mv ${kg.path} ${kg.rival}\n`
-            +`ln -s ${kg.rival} ${kg.path}`,
+            +`mv ${shq(kg.rival)} ${shq(kg.rival+'.empty.bak')}\n`
+            +`mv ${shq(kg.path)} ${shq(kg.rival)}\n`
+            +`ln -s ${shq(kg.rival)} ${shq(kg.path)}`,
          note:"Prefer this if the daemon is the only writer and you want the real file living in "
              +"the palace directory. Same end state, opposite direction."}],
-      verify:`readlink -f ${kg.rival}\n# must resolve to ${kg.path}\n`
+      verify:`readlink -f ${shq(kg.rival)}\n# must resolve to ${shq(kg.path)}\n`
             +`# then restart both and confirm kg_stats reports the real counts.`,
-      undo:`rm ${kg.rival} && mv ${kg.rival}.empty.bak ${kg.rival}`});
+      undo:`rm ${shq(kg.rival)} && mv ${shq(kg.rival+'.empty.bak')} ${shq(kg.rival)}`});
   }
 
   if(s.available && s.disk_total){
@@ -1753,7 +1768,7 @@ function healthIssues(){
       why:s.dedicated ? "This volume is dedicated to MemPalace, so it is your palace that runs out."
                       : "This volume is shared with the OS — your palace is competing with everything "
                        +"else on the machine for what is left.",
-      fixes:[{label:"Free space or grow the volume", cmd:`du -sh ${s.data_path||s.mount}/* | sort -h | tail`}],
+      fixes:[{label:"Free space or grow the volume", cmd:`du -sh ${shq(s.data_path||s.mount)}/* | sort -h | tail`}],
       verify:"Reload this page; the storage bar should drop below 75%.",
       undo:"n/a — nothing here is destructive."});
   }
