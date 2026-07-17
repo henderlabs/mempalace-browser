@@ -1591,18 +1591,26 @@ function renderChips(){
   chip.style.display = nu ? "" : "none";
   chip.textContent = nu + " new";
 
+  // The zero case is a count, not a badge. "Healthy" alone reads as decoration
+  // — it looks the same whether we checked and found nothing or never checked
+  // at all. "Healthy · 0 warnings" is visibly the same counter that says
+  // "9 warnings" when there are nine, so a green chip is evidence of watching
+  // rather than an assertion of wellness.
   const issues = healthIssues();
   const hc = document.getElementById("healthChip");
   const bad = issues.some(i => i.level === "bad");
+  const n = issues.length;
+  const plural = n === 1 ? "warning" : "warnings";
   if(bad){
-    hc.className = "chip act bad"; hc.textContent = "Needs attention";
-  } else if(issues.length){
-    hc.className = "chip act warn";
-    hc.textContent = issues.length === 1 ? "1 warning" : issues.length + " warnings";
+    hc.className = "chip act bad"; hc.textContent = `Needs attention · ${n} ${plural}`;
+  } else if(n){
+    hc.className = "chip act warn"; hc.textContent = `${n} ${plural}`;
   } else {
-    hc.className = "chip act ok"; hc.textContent = "Healthy";
+    hc.className = "chip act ok"; hc.textContent = "Healthy · 0 warnings";
   }
-  hc.title = issues.length ? issues.map(i => i.text).join("\n") : "No warnings — click for details";
+  hc.title = n ? issues.map(i => "• " + i.text).join("\n")
+              : "Checked: embedder identity, knowledge-graph split, disk, "
+                + "update check, document chunk ordering. Nothing to report.";
 
   // Escape these too. They look trustworthy — one is our own package version,
   // the other comes from PyPI over HTTPS — but "the input is probably fine" is
@@ -1661,7 +1669,10 @@ function systemSheet(){
   sheet(`
     <h2>System status — ${esc(state)}</h2>
     <p class="sub">What this deployment is reading, and anything wrong with it.</p>
-    <h3>Warnings</h3>${notes}
+    <h3>Warnings (${issues.length})</h3>${notes}
+    <p class="sub" style="margin:8px 0 0;font-size:11px">Checked every read:
+      embedder identity · knowledge-graph split · disk headroom · update check ·
+      document chunk ordering.</p>
     <h3>Palace</h3>
     <dl class="kv">
       <dt>Path</dt><dd>${esc(DATA.palace_path)}</dd>
