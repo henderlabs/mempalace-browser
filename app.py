@@ -20,6 +20,7 @@ Unofficial; not affiliated with the MemPalace project. MIT licensed.
 Styling follows the HenderLabs brand palette.
 """
 
+import hashlib
 import html
 import http.server
 import json
@@ -48,8 +49,37 @@ PORT = int(os.environ.get("MPB_PORT", "8080"))
 # in the header reports MemPalace's version, because that is the number a user
 # is actually asking about, and conflating the two is how a browser ends up
 # claiming its host library is out of date.
-MPB_VERSION = "0.2.0"
+MPB_VERSION = "0.2.0"          # matches the v0.2.0 tag on the repo below
 REPO_URL = "https://github.com/henderlabs/mempalace-browser"
+
+
+def _build_id():
+    """Fingerprint the source actually running, by hashing this file.
+
+    A hardcoded version string drifts the moment anyone edits without bumping
+    it, and then says "0.2.0" about something that is not 0.2.0. A hash of the
+    file cannot: it is derived from the thing itself rather than asserted
+    alongside it.
+
+    It makes one question answerable from the page that otherwise takes an ssh
+    and a shasum: is this box running what the repo says? Compare this against
+    `shasum -a 256 app.py` in the checkout. They match or they do not — and
+    "the deployment silently drifted from the repo" is exactly the class of
+    bug this program exists to not have.
+
+    Deliberately not a git SHA: there is no .git next to the deployment (only
+    app.py and run.sh are copied over), and a commit cannot contain its own
+    hash anyway.
+    """
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:12]
+    except OSError:
+        # Never invent one. An unknown build is a fact; a wrong build is a lie.
+        return "unknown"
+
+
+BUILD_ID = _build_id()
 
 # The HenderLabs mark — three layers, painted bottom to top. Inlined rather
 # than read from assets/ because this program is one file with no static dir,
@@ -551,6 +581,7 @@ def read_palace(force=False):
                 "layers": _layer_counts(drawers),
                 "palace_notes": [],
                 "mpb_version": MPB_VERSION,
+                "build_id": BUILD_ID,
                 "repo_url": REPO_URL,
                 "demo": True,
             }
@@ -609,6 +640,7 @@ def read_palace(force=False):
             "layers": _layer_counts(drawers),
             "palace_notes": list(_palace_notes_seen),
             "mpb_version": MPB_VERSION,
+            "build_id": BUILD_ID,
             "repo_url": REPO_URL,
         }
         _palace_cache.update(at=now, data=data)
@@ -928,6 +960,8 @@ INDEX_HTML = r"""<!doctype html>
   /* The byline. Graphite is the logo's middle layer, so it sits under the
      product name without competing with it — and goes brand blue on hover to
      admit it is a link. */
+  .about .bld { font-weight:500; color:var(--fg-subtle); font-family:var(--mono);
+                font-size:9.5px; letter-spacing:0; }
   .about .by { display:block; font-size:10px; color:var(--graphite);
                text-decoration:none; letter-spacing:.015em; margin-top:1px; }
   .about .by:hover { color:var(--brand); }
@@ -1301,7 +1335,8 @@ function aboutHtml(){
   return `<div class="about">
     <img class="ic" src="/icon.svg" alt="">
     <div>
-      <div class="nm">MemPalace Browser <b>${esc(DATA.mpb_version || "—")}</b></div>
+      <div class="nm">MemPalace Browser <b>${esc(DATA.mpb_version || "—")}</b>
+        <span class="bld" title="sha256 of the running app.py — compare with the repo">build ${esc(DATA.build_id || "—")}</span></div>
       <a class="by" href="https://henderlabs.com" target="_blank"
          rel="noopener noreferrer">henderlabs.com</a>
       <div class="sub" style="margin-top:5px">
@@ -1640,7 +1675,8 @@ function systemSheet(){
         v.status==="disabled" ? " (update check off)" : " (update check failed)"}
         · <a href="${MP_REPO}" target="_blank" rel="noopener noreferrer"
              style="color:var(--brand)">project ↗</a></dd>
-      <dt>This browser</dt><dd>MemPalace Browser ${esc(DATA.mpb_version || "—")} — unofficial,
+      <dt>This browser</dt><dd>MemPalace Browser ${esc(DATA.mpb_version || "—")} · build
+        ${esc(DATA.build_id || "—")} — unofficial,
         not affiliated with the MemPalace project${DATA.repo_url
           ? ` · <a href="${esc(DATA.repo_url)}" target="_blank" rel="noopener noreferrer"
                  style="color:var(--brand)">source ↗</a>` : ""}</dd>
@@ -1796,6 +1832,7 @@ if __name__ == "__main__":
         print(f"  installed : {MP_VERSION}  (checking PyPI in background)")
     else:
         print(f"  installed : {MP_VERSION}  (update check off — no outbound requests)")
+    print(f"  browser   : MemPalace Browser {MPB_VERSION}  build {BUILD_ID}")
     print(f"  serving   : http://{BIND}:{PORT}/")
     print(f"  hosts     : {', '.join(sorted(ALLOWED_HOSTS))}")
     if BIND != "127.0.0.1":
