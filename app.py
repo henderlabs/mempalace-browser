@@ -1408,7 +1408,11 @@ function renderStats(){
   const max = Math.max(1, ...keys.map(k => counts[k]));
   const mlab = k => new Date(k+"-01").toLocaleDateString(undefined,{month:"short"});
 
-  document.getElementById("info").innerHTML = storeHtml + resourcesHtml() + `
+  // Host first: "is this machine healthy" frames everything under it. Storage
+  // only carries a top gap when something sits above it.
+  const resHtml = resourcesHtml();
+  document.getElementById("info").innerHTML = resHtml
+    + `<div${resHtml ? ' style="margin-top:13px"' : ""}>${storeHtml}</div>` + `
     <div class="st-h" style="margin-top:13px">Drawers filed · 12mo</div>
     <div class="spark">${keys.map(k =>
       `<i class="${counts[k]?"has":""}" style="height:${counts[k]? Math.max(8,counts[k]/max*100):2}%"
@@ -1459,19 +1463,21 @@ function resourcesHtml(){
   const r = DATA.resources || {};
   if(!r.enabled) return "";
   if(!r.available)
-    return `<div class="st-h" style="margin-top:13px">Host</div>
+    return `<div class="st-h">Host</div>
             <div class="st-note" style="color:var(--fg-subtle)">${esc(r.reason||"unavailable")}</div>`;
   const pct = r.mem_total ? (r.mem_used / r.mem_total * 100) : 0;
   const cls = pct > 90 ? "bad" : pct > 75 ? "warn" : "";
+  // Load is shown against core count, because 0.32 means nothing until you know
+  // whether the box has one core or thirty-two.
   const lpc = Math.min(100, (r.load1 / (r.cpus||1)) * 100);
   const lcls = lpc > 100 ? "bad" : lpc > 70 ? "warn" : "";
-  return `<div class="st-h" style="margin-top:13px">Host</div>
-    <div class="st-row"><span>Memory</span><span>${bytes(r.mem_used)} / ${bytes(r.mem_total)}</span></div>
+  return `<div class="st-h">Host</div>
+    <div class="st-row"><span>Load (1m)</span><span>${r.load1.toFixed(2)} / ${r.cpus} cpu</span></div>
+    <div class="bar ${lcls}"><i style="width:${Math.max(0.6,lpc).toFixed(1)}%"></i></div>
+    <div class="st-row" style="margin-top:5px"><span>Memory</span><span>${bytes(r.mem_used)} / ${bytes(r.mem_total)}</span></div>
     <div class="bar ${cls}"><i style="width:${Math.max(0.6,pct).toFixed(1)}%"></i></div>
     <div class="st-row"><span>Available</span><span>${bytes(r.mem_avail)}</span></div>
     ${r.swap_total ? `<div class="st-row"><span>Swap</span><span>${bytes(r.swap_used)} / ${bytes(r.swap_total)}</span></div>` : ""}
-    <div class="st-row" style="margin-top:5px"><span>Load (1m)</span><span>${r.load1.toFixed(2)} / ${r.cpus} cpu</span></div>
-    <div class="bar ${lcls}"><i style="width:${Math.max(0.6,lpc).toFixed(1)}%"></i></div>
     <div class="st-note">this machine, not MemPalace — the embedder and the vector index live in RAM</div>`;
 }
 
