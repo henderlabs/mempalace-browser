@@ -4,7 +4,8 @@
 
 MemPalace stores your AI's memory as drawers, filed into rooms and wings. It is optimised for
 agent retrieval — an agent asks, and the right memories come back. This is the human view of the
-same data: browse the wings, read the drawers, search the lot, and see how much disk it is using.
+same data: browse the wings, read the drawers, search the lot, and find out what is actually in
+your palace — including the parts of it that are empty.
 
 One file, standard library only, no database of its own, no build step.
 
@@ -13,6 +14,46 @@ One file, standard library only, no database of its own, no build step.
 > report them [in this repo](https://github.com/henderlabs/mempalace-browser/issues), not upstream.
 
 ![MemPalace Browser demo screenshot](assets/demo.png)
+
+## What it shows
+
+**Drawers** — the wing → room → drawer tree, with instant client-side search over the whole
+palace. Search is plain substring matching, not semantic: the entire palace ships to your browser
+in one payload, so it is instant and works offline.
+
+**Documents** — a drawer is an ~800-character verbatim chunk, so a long file reads as fragments
+that start mid-sentence. This regroups chunks by `source_file` back into the document they came
+from. It is a separate view rather than a level of the tree, because the miner files chunks by
+topic: one file's chunks legitimately scatter across several rooms, so a document has no single
+place to live. (`chunk_index` restarts per room, which this accounts for.)
+
+**Layers** — what your palace actually contains, with coverage. A palace offers closets, halls,
+entities, hallways, tunnels and a knowledge graph, and in most palaces most of them have never
+been written to. Nothing tells you that — an empty knowledge graph answers a query with
+`count: 0`, which reads as *"there are no such facts"* rather than *"this layer is empty"*. This
+panel is the difference between those two. A layer it cannot read says **unavailable**, never zero.
+
+**System status** — one chip, honest in both directions. It reads `Healthy · 0 warnings` rather
+than `Healthy`, because a badge looks identical whether it checked and found nothing or never
+checked at all. It never shows green while a warning is live.
+
+**Host** *(opt-in)* — CPU load and memory for the machine, if you want them. See
+[Configuration](#configuration).
+
+## Warnings come with a fix
+
+When something is wrong, the browser tells you **what is wrong, why it matters, what to run, how
+to verify it worked, and how to undo it** — and offers to hand the whole advisory to your agent as
+one self-contained prompt.
+
+**It never applies the fix itself, and it never will.** This program is read-only by construction,
+and it answers with no authentication. A *"Fix it"* button would be unauthenticated remote command
+execution on the machine holding your memory. But MemPalace is a tool for agents — so an accurate
+diagnosis *is* the actuator. Copy it, hand it to your agent, let the agent do the work.
+
+Where more than one fix is legitimate, it shows both with the tradeoff stated instead of picking
+for you. Where a fix is not verified, it says so and offers no command — an unverified fix is
+worse than none when the wrong guess deletes drawers.
 
 ## Status
 
@@ -57,6 +98,7 @@ Everything is optional. Defaults are chosen so that running it with no configura
 | `MPB_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Extra `Host` headers to accept, comma-separated. Needed if you reach it by a hostname — e.g. `MPB_ALLOWED_HOSTS=palace.lan` |
 | `MPB_CHECK_UPDATES` | `1` | `0` disables the PyPI version check — see [Network](#network) |
 | `MPB_DEMO` | *(off)* | `1` renders synthetic drawers and never imports MemPalace |
+| `MPB_RESOURCES` | *(off)* | `1` shows host CPU load and memory. Worth it on a box dedicated to MemPalace — the embedder loads a model into RAM and the vector index lives there too, so RAM runs out before disk does. On a shared box the numbers describe everything except your palace. Linux only; elsewhere it reports *unavailable*. |
 | `MEMPALACE_PYTHON` | *(auto-detected)* | Interpreter to use, if auto-detection picks wrong |
 
 The palace itself is located by asking MemPalace, so `MEMPALACE_PALACE_PATH` and your

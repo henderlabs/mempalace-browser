@@ -49,7 +49,7 @@ PORT = int(os.environ.get("MPB_PORT", "8080"))
 # in the header reports MemPalace's version, because that is the number a user
 # is actually asking about, and conflating the two is how a browser ends up
 # claiming its host library is out of date.
-MPB_VERSION = "0.2.0"          # matches the v0.2.0 tag on the repo below
+MPB_VERSION = "0.3.0"          # matches the v0.3.0 tag on the repo below
 REPO_URL = "https://github.com/henderlabs/mempalace-browser"
 
 
