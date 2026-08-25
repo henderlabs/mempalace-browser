@@ -127,7 +127,10 @@ for _h in os.environ.get("MPB_ALLOWED_HOSTS", "").split(","):
     if _h.strip():
         ALLOWED_HOSTS.add(_h.strip().lower())
 PYPI_TTL = 3600           # seconds to cache the PyPI lookup
-PALACE_TTL = 30           # seconds to cache the palace read
+PALACE_TTL = 120          # seconds to cache the palace read (a stale read is served instantly — see read_palace())
+PALACE_PAGE_SIZE = 5000   # rows per col.get() call — a large palace hit "too many SQL
+                          # variables" around 33,000 in testing; this stays well clear
+                          # of that while cutting round trips roughly 5x vs. a smaller page
 PYPI_URL = "https://pypi.org/pypi/mempalace/json"
 
 # Demo mode renders synthetic drawers and never imports mempalace. It exists so
@@ -466,6 +469,10 @@ def build_documents(drawers):
             "first": filed[0] if filed else "",
             "last": filed[-1] if filed else "",
             "issues": issues,
+            # First chunk in reading order, not full content — this list ships
+            # to the client in bulk; full text is fetched per-document on open
+            # via /api/document.
+            "preview": items[0]["content"][:200] if items else "",
         })
     docs.sort(key=lambda x: (-x["n"], x["key"]))
     return docs
@@ -569,6 +576,7 @@ def _layer_counts(drawers):
 # ---------------------------------------------------------------- palace read
 _palace_cache = {"at": 0.0, "data": None}
 _palace_lock = threading.Lock()
+_refresh_lock = threading.Lock()   # at most one background refresh in flight
 
 # MemPalace raises a palace's warnings exactly ONCE per process — the second
 # get_collection() for the same collection is silent. Our read is cached for
@@ -640,90 +648,180 @@ def _demo_drawers():
 
 def read_palace(force=False):
     with _palace_lock:
-        if not force and _palace_cache["data"] and (time.time() - _palace_cache["at"]) < PALACE_TTL:
-            return _palace_cache["data"]
+        cached = _palace_cache["data"]
+        fresh = bool(cached) and (time.time() - _palace_cache["at"]) < PALACE_TTL
 
-        if DEMO:
-            drawers = _demo_drawers()
-            drawers.sort(key=lambda d: d["filed_at"], reverse=True)
-            now = time.time()
-            data = {
-                "drawers": drawers, "count": len(drawers),
-                "palace_path": PALACE_PATH,
-                "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
-                "storage": storage_info(),
-                "resources": resource_info(),
-                "documents": build_documents(drawers),
-                "layers": _layer_counts(drawers),
-                "palace_notes": [],
-                "mpb_version": MPB_VERSION,
-                "build_id": BUILD_ID,
-                "repo_url": REPO_URL,
-                "upgrade_cmd": _upgrade_hint(),
-                "demo": True,
-            }
-            _palace_cache.update(at=now, data=data)
-            return data
+    if cached is not None and not force and fresh:
+        return cached
 
-        # Capture warnings MemPalace raises while opening the collection. The
-        # embedder-identity warning is the one that matters: it goes to stderr
-        # and nowhere else, so anyone who started this detached never sees it —
-        # yet it means the palace has no recorded embedder, and if the default
-        # model ever changes, new embeddings silently mismatch every drawer
-        # already filed. That is palace health, and it belongs on screen.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            col = get_collection(
-                PALACE_PATH,
-                collection_name=COLLECTION,
-                create=False,            # never manufacture a palace
-            )
-            for w in caught:
-                msg = str(w.message)[:240]
-                if msg not in _palace_notes_seen:
-                    _palace_notes_seen.append(msg)
+    if cached is None or force:
+        # No cache yet, or the caller explicitly asked for the current state
+        # (the Refresh button, or startup) — both must wait for the real read.
+        return _read_palace_now()
 
-        res = col.get(include=["metadatas", "documents"])
-        ids = list(res.ids or [])
-        metas = list(res.metadatas or [])
-        docs = list(res.documents or [])
+    # Stale, not absent, and nobody asked for a forced refresh: hand back what
+    # we have right now and bring it current in the background instead of
+    # blocking this request on it. A full reload pages through the whole
+    # collection and can take several seconds on a large palace — blocking
+    # whichever request happens to land the moment the TTL lapses (often a
+    # drawer or document someone just clicked open) is what turns into a
+    # browser-side fetch failure in practice, not a clean slow response.
+    if _refresh_lock.acquire(blocking=False):
+        def _background_refresh():
+            try:
+                _read_palace_now()
+            except Exception:
+                pass  # the next request retries; this thread has no caller to report to
+            finally:
+                _refresh_lock.release()
+        threading.Thread(target=_background_refresh, daemon=True).start()
+    return cached
 
-        drawers = []
-        for i, did in enumerate(ids):
-            m = dict(metas[i] or {})
-            ci = m.get("chunk_index")
-            drawers.append({
-                "id": did,
-                "wing": m.get("wing") or "(unfiled)",
-                "room": m.get("room") or "(none)",
-                "filed_at": m.get("filed_at") or "",
-                "added_by": m.get("added_by") or "",
-                "source_file": m.get("source_file") or "",
-                "chunk_index": ci if isinstance(ci, int) else None,
-                "content": docs[i] or "",
-                "bytes": len((docs[i] or "").encode("utf-8")),
-                "meta": {k: str(v) for k, v in m.items()},
-            })
 
+def _read_palace_now():
+    """Do the actual, possibly slow, read — no caching decisions here.
+
+    Deliberately holds no lock across the read itself: it can take several
+    seconds on a large palace, and read_palace() may run this in a background
+    thread while other requests keep serving the previous cached result. Only
+    the final cache write is synchronized.
+    """
+    if DEMO:
+        drawers = _demo_drawers()
         drawers.sort(key=lambda d: d["filed_at"], reverse=True)
         now = time.time()
         data = {
-            "drawers": drawers,
-            "count": len(drawers),
+            "drawers": drawers, "count": len(drawers),
             "palace_path": PALACE_PATH,
             "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
             "storage": storage_info(),
             "resources": resource_info(),
             "documents": build_documents(drawers),
             "layers": _layer_counts(drawers),
-            "palace_notes": list(_palace_notes_seen),
+            "palace_notes": [],
             "mpb_version": MPB_VERSION,
             "build_id": BUILD_ID,
             "repo_url": REPO_URL,
             "upgrade_cmd": _upgrade_hint(),
+            "demo": True,
         }
-        _palace_cache.update(at=now, data=data)
+        with _palace_lock:
+            _palace_cache.update(at=now, data=data)
         return data
+
+    # Capture warnings MemPalace raises while opening the collection. The
+    # embedder-identity warning is the one that matters: it goes to stderr
+    # and nowhere else, so anyone who started this detached never sees it —
+    # yet it means the palace has no recorded embedder, and if the default
+    # model ever changes, new embeddings silently mismatch every drawer
+    # already filed. That is palace health, and it belongs on screen.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        col = get_collection(
+            PALACE_PATH,
+            collection_name=COLLECTION,
+            create=False,            # never manufacture a palace
+        )
+        for w in caught:
+            msg = str(w.message)[:240]
+            if msg not in _palace_notes_seen:
+                _palace_notes_seen.append(msg)
+
+    # Fetch in pages rather than one unbounded get(). Chroma's local
+    # SQLite-backed engine binds a parameter per matched row, and a large
+    # palace (tens of thousands of drawers) blows past SQLite's per-
+    # statement variable limit — "too many SQL variables" — if asked for
+    # everything at once.
+    ids, metas, docs = [], [], []
+    offset = 0
+    while True:
+        page = col.get(include=["metadatas", "documents"], limit=PALACE_PAGE_SIZE, offset=offset)
+        page_ids = page.ids or []
+        if not page_ids:
+            break
+        ids.extend(page_ids)
+        metas.extend(page.metadatas or [])
+        docs.extend(page.documents or [])
+        offset += len(page_ids)
+
+    drawers = []
+    for i, did in enumerate(ids):
+        m = dict(metas[i] or {})
+        ci = m.get("chunk_index")
+        drawers.append({
+            "id": did,
+            "wing": m.get("wing") or "(unfiled)",
+            "room": m.get("room") or "(none)",
+            "filed_at": m.get("filed_at") or "",
+            "added_by": m.get("added_by") or "",
+            "source_file": m.get("source_file") or "",
+            "chunk_index": ci if isinstance(ci, int) else None,
+            "content": docs[i] or "",
+            "bytes": len((docs[i] or "").encode("utf-8")),
+            "meta": {k: str(v) for k, v in m.items()},
+        })
+
+    drawers.sort(key=lambda d: d["filed_at"], reverse=True)
+    now = time.time()
+    data = {
+        "drawers": drawers,
+        "count": len(drawers),
+        "palace_path": PALACE_PATH,
+        "read_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+        "storage": storage_info(),
+        "resources": resource_info(),
+        "documents": build_documents(drawers),
+        "layers": _layer_counts(drawers),
+        "palace_notes": list(_palace_notes_seen),
+        "mpb_version": MPB_VERSION,
+        "build_id": BUILD_ID,
+        "repo_url": REPO_URL,
+        "upgrade_cmd": _upgrade_hint(),
+    }
+    with _palace_lock:
+        _palace_cache.update(at=now, data=data)
+    return data
+
+
+def _drawer_index(data):
+    """id -> drawer, memoized on the cached palace dict.
+
+    Rebuilt only when read_palace() actually re-reads (TTL expiry or a forced
+    refresh installs a new dict) — cheap to keep on hand for /api/drawer and
+    /api/document, which each look up a handful of ids per request rather than
+    scanning the whole collection.
+    """
+    idx = data.get("_by_id")
+    if idx is None:
+        idx = {d["id"]: d for d in data["drawers"]}
+        data["_by_id"] = idx
+    return idx
+
+
+def _preview(content, query=""):
+    """A short slice of a drawer's content for list display.
+
+    With no query, just the first 240 characters — enough for a card. With
+    one, center the slice on the first match so scrolling a hit list doesn't
+    mean staring at 240 characters that never mention what you searched for.
+    """
+    if not query:
+        return content[:240]
+    k = content.lower().find(query.lower())
+    if k > 90:
+        return "…" + content[max(0, k - 60):k + 180]
+    return content[:240]
+
+
+def _slim_drawer(d, query=""):
+    """The wire-sized projection of a drawer: what /api/data and /api/search
+    send in bulk. Full content and metadata are fetched per-drawer, on open,
+    via /api/drawer — sending them for all of them is what made a large
+    palace ship a payload sized in the hundreds of megabytes."""
+    return {
+        "id": d["id"], "wing": d["wing"], "room": d["room"],
+        "filed_at": d["filed_at"], "preview": _preview(d["content"], query),
+    }
 
 
 # ---------------------------------------------------------------- http
@@ -741,6 +839,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+        # Headers are committed to the wire from here on — a failure writing
+        # the body (e.g. the client aborted a large document mid-download)
+        # must not be treated as "nothing was sent yet" by the caller. Without
+        # this flag, do_GET's except would call _send() again for the error,
+        # writing a second HTTP response onto the same connection on top of
+        # the first one's now-broken framing — which is what actually reaches
+        # the browser as a generic network error, not the real cause.
+        self._mpb_headers_sent = True
         self.wfile.write(body)
 
     @staticmethod
@@ -807,6 +913,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Parse properly: `?x=notrefresh=1` must NOT force a re-read.
         force = "1" in urllib.parse.parse_qs(qs).get("refresh", [])
+        self._mpb_headers_sent = False
         try:
             if path == "/":
                 self._send(200, INDEX_HTML, "text/html; charset=utf-8")
@@ -814,8 +921,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, ICON_SVG, "image/svg+xml")
             elif path == "/api/data":
                 payload = read_palace(force=force)
-                payload["version"] = version_info()
-                self._send(200, json.dumps(payload), "application/json")
+                slim = dict(payload)
+                slim.pop("_by_id", None)
+                slim["drawers"] = [_slim_drawer(d) for d in payload["drawers"]]
+                slim["version"] = version_info()
+                self._send(200, json.dumps(slim), "application/json")
+            elif path == "/api/drawer":
+                payload = read_palace()
+                did = urllib.parse.parse_qs(qs).get("id", [""])[0]
+                d = _drawer_index(payload).get(did) if did else None
+                if d is None:
+                    self._send(404, json.dumps({"error": "unknown drawer id"}), "application/json")
+                else:
+                    self._send(200, json.dumps({
+                        "id": d["id"], "content": d["content"], "meta": d["meta"],
+                        "bytes": d["bytes"], "chunk_index": d["chunk_index"],
+                    }), "application/json")
+            elif path == "/api/document":
+                payload = read_palace()
+                key = urllib.parse.parse_qs(qs).get("key", [""])[0]
+                doc = next((x for x in payload["documents"] if x["key"] == key), None) if key else None
+                if doc is None:
+                    self._send(404, json.dumps({"error": "unknown document key"}), "application/json")
+                else:
+                    idx = _drawer_index(payload)
+                    chunks = [{"id": did, "content": idx[did]["content"], "chunk_index": idx[did]["chunk_index"]}
+                              for did in doc["ids"] if did in idx]
+                    self._send(200, json.dumps({"key": key, "chunks": chunks}), "application/json")
+            elif path == "/api/search":
+                payload = read_palace()
+                q = urllib.parse.parse_qs(qs).get("q", [""])[0].strip()
+                hits, doc_keys = [], set()
+                if q:
+                    ql = q.lower()
+                    for d in payload["drawers"]:
+                        hay = "%s %s %s %s %s" % (
+                            d["content"], d["id"], d["wing"], d["room"], d["source_file"])
+                        if ql in hay.lower():
+                            hits.append(_slim_drawer(d, q))
+                            if d["source_file"]:
+                                doc_keys.add(d["source_file"])
+                self._send(200, json.dumps({"hits": hits, "doc_keys": sorted(doc_keys)}), "application/json")
             elif path == "/api/version":
                 self._send(200, json.dumps(version_info(force=True)), "application/json")
             elif path == "/api/health":
@@ -857,10 +1003,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     ), "application/json")
             else:
                 self._send(404, json.dumps({"error": "not found"}), "application/json")
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client went away mid-response — nothing to send back to
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self._send(500, json.dumps({"error": str(e)}), "application/json")
+            if not self._mpb_headers_sent:
+                self._send(500, json.dumps({"error": str(e)}), "application/json")
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -1123,9 +1272,9 @@ INDEX_HTML = r"""<!doctype html>
 
   /* Search lives in the header, filling the gap between the chips and Refresh.
      It belongs with the global controls rather than above the tree, because it
-     is global: matchesQuery() deliberately ignores the selected wing so the
-     tree can show where hits live across the whole palace. Sitting above the
-     tree implied it searched the selection. It never did. */
+     is global: pool() deliberately ignores the selected wing so the tree can
+     show where hits live across the whole palace. Sitting above the tree
+     implied it searched the selection. It never did. */
   #q { flex:1 1 auto; min-width:0; padding:8px 11px; border-radius:7px;
        border:1px solid var(--line-2);
        background:var(--bg); color:var(--fg); font-size:13px; }
@@ -1201,6 +1350,10 @@ INDEX_HTML = r"""<!doctype html>
             padding:14px; white-space:pre-wrap; word-wrap:break-word; font-size:12.5px;
             font-family:var(--mono); line-height:1.65; margin:0; color:var(--fg-muted); }
   .empty { color:var(--fg-subtle); text-align:center; padding:50px 20px; }
+  .loadmore { display:block; width:100%; font:inherit; font-size:12px; color:var(--brand);
+              background:var(--surface); border:1px solid var(--line); border-radius:8px;
+              padding:11px 13px; cursor:pointer; transition:border-color .12s; }
+  .loadmore:hover { border-color:var(--brand); }
   .err { color:var(--error); font-family:var(--mono); font-size:12px; }
 
   /* A reassembled document. Chunk seams stay visible: this is 27 verbatim
@@ -1266,10 +1419,31 @@ let DATA = null, sel = {wing:null, room:null}, query = "", lastSeen = null, read
 // "drawers" = the wing/room tree. "documents" = chunks regrouped into the file
 // they were mined from. Two lenses over one set of drawers, never two trees.
 let view = "drawers";
+const LIST_PAGE = 300;      // cards rendered per batch — a big wing can hold tens of thousands
+let listLimit = LIST_PAGE;
 let byId = {};              // drawer id -> drawer, for document assembly
 let docOfDrawer = {};       // drawer id -> the document it belongs to
 
+// A palace can hold tens of thousands of drawers, each with full content —
+// far too much to ship in one bulk payload. /api/data sends only metadata and
+// a short preview per drawer; a search query is answered by the server too
+// (/api/search), over its own already-loaded copy of the full text. searchHits
+// is that answer — null means "no query", not "no results".
+let searchHits = null, docKeySet = null, searchSeq = 0;
+
 const LS_KEY = "mpb.lastSeen";
+const VIEWED_KEY = "mpb.viewedNew";
+// Ids of "new" drawers you've actually opened — so the tag clears once you've
+// looked at it, rather than staying lit until the next Refresh moves the
+// baseline. Pruned in load() to whatever is still new; nothing else ever
+// touches it, so it can't grow past "new drawers I've opened since the last
+// baseline move."
+let viewedNew = new Set(JSON.parse(localStorage.getItem(VIEWED_KEY) || "[]"));
+function markViewed(id){
+  if(viewedNew.has(id)) return;
+  viewedNew.add(id);
+  localStorage.setItem(VIEWED_KEY, JSON.stringify([...viewedNew]));
+}
 
 // ---- clock: rendered in YOUR browser's timezone. The box runs UTC, so
 // server-side rendering would show the wrong time. This is always right.
@@ -1310,23 +1484,24 @@ function bytes(n){
   return (n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)) + " " + u[i];
 }
 
-// A drawer is "new" if it was filed after the last time you hit Refresh.
-const isNew = d => lastSeen && d.filed_at && d.filed_at > lastSeen;
+// A drawer is "new" if it was filed after the last time you hit Refresh —
+// and you haven't opened it since.
+const isNew = d => lastSeen && d.filed_at && d.filed_at > lastSeen && !viewedNew.has(d.id);
 
 // ---- filtering: two separate questions, deliberately kept apart. "Does this
 // match the search text?" and "is it in the selected wing/room?" The tree needs
 // the first only — it must show where matches live across ALL wings, even while
 // one wing is selected.
-function matchesQuery(d){
-  if(!query) return true;
-  const q = query.toLowerCase();
-  return (d.content + " " + d.id + " " + d.wing + " " + d.room + " " + d.source_file)
-           .toLowerCase().includes(q);
-}
+//
+// The first question is answered server-side now (searchHits, from
+// /api/search) because it takes full drawer content to answer and the client
+// no longer holds that in bulk. pool() is every drawer that answers it: the
+// full slim list with no query, or the current search hits with one.
+function pool(){ return query ? (searchHits || []) : DATA.drawers; }
 function matches(d){
   if(sel.wing && d.wing !== sel.wing) return false;
   if(sel.room && d.room !== sel.room) return false;
-  return matchesQuery(d);
+  return true;
 }
 
 function wireNav(container){
@@ -1345,9 +1520,9 @@ function wireNav(container){
 }
 
 function renderTree(){
-  const pool = DATA.drawers.filter(matchesQuery);
+  const items = pool();
   const wings = {};
-  for(const d of pool){
+  for(const d of items){
     (wings[d.wing] ??= {rooms:{}, n:0, nu:0});
     wings[d.wing].rooms[d.room] = wings[d.wing].rooms[d.room] || {n:0, nu:0};
     wings[d.wing].rooms[d.room].n++;
@@ -1542,8 +1717,8 @@ function layersHtml(){
       — room names shared across wings, derived not stored.</div>${rival}`;
 }
 
-function renderList(){
-  const hits = DATA.drawers.filter(matches);
+function renderList(preserveScroll){
+  const hits = pool().filter(matches);
   const c = document.getElementById("content");
   const crumb = `<div class="crumb"><a data-nav="all">All wings</a>`
     + (sel.wing ? ` / <a data-nav="wing" data-w="${esc(sel.wing)}">${esc(sel.wing)}</a>` : "")
@@ -1553,25 +1728,53 @@ function renderList(){
     c.innerHTML = crumb + `<div class="empty">No drawers match.</div>`;
     wireNav(c); return;
   }
-  c.innerHTML = crumb + hits.map(d => {
-    let prev = d.content.slice(0,240);
-    if(query){
-      const k = d.content.toLowerCase().indexOf(query.toLowerCase());
-      if(k > 90) prev = "…" + d.content.slice(k-60, k+180);
-    }
-    return `<div class="card${isNew(d)?" isnew":""}" data-i="${DATA.drawers.indexOf(d)}">
+  // A wing can hold tens of thousands of drawers — render only one page of
+  // cards at a time. Rendering them all at once is what made navigation feel
+  // frozen: tens of thousands of DOM nodes built and laid out on every click.
+  const shown = hits.slice(0, listLimit);
+  const remaining = hits.length - shown.length;
+  c.innerHTML = crumb + shown.map(d => {
+    return `<div class="card${isNew(d)?" isnew":""}" data-id="${esc(d.id)}">
       <div class="top"><span class="loc">${esc(d.wing)} / ${esc(d.room)}</span>
         ${isNew(d) ? '<span class="pill">new</span>' : ""}
         <span class="when">${when(d.filed_at)}</span></div>
-      <div class="prev">${hl(prev, query)}</div></div>`;
-  }).join("");
+      <div class="prev">${hl(d.preview || "", query)}</div></div>`;
+  }).join("")
+  + (remaining > 0
+      ? `<button class="loadmore" data-more>Show ${Math.min(LIST_PAGE, remaining)} more (${remaining} left)</button>`
+      : "");
   wireNav(c);
   c.querySelectorAll(".card").forEach(el =>
-    el.onclick = () => detail(DATA.drawers[+el.dataset.i]));
-  c.scrollTop = 0;
+    el.onclick = () => detail(byId[el.dataset.id]));
+  const more = c.querySelector("[data-more]");
+  if(more) more.onclick = () => { listLimit += LIST_PAGE; renderList(true); };
+  if(!preserveScroll) c.scrollTop = 0;
 }
 
-function detail(d){
+// A drawer arrives from /api/data or /api/search with only a preview — full
+// content, metadata, and byte count are fetched here, on open, and merged
+// into the same object cached in byId so re-opening it costs nothing.
+async function detail(d){
+  const c = document.getElementById("content");
+  if(d.content === undefined){
+    c.innerHTML = `<div class="crumb"><a data-back>← back</a></div><div class="empty">Loading…</div>`;
+    c.querySelector("[data-back]").onclick = () => render();
+    let full;
+    try {
+      const r = await fetch("/api/drawer?id=" + encodeURIComponent(d.id));
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      full = await r.json();
+    } catch(e){
+      c.innerHTML = `<div class="empty">Could not load this drawer: ${esc(String(e))}</div>`;
+      return;
+    }
+    Object.assign(d, full);
+  }
+  markViewed(d.id);
+  renderDetail(d);
+}
+
+function renderDetail(d){
   const skip = new Set(["wing","room"]);
   const rows = Object.entries(d.meta).filter(([k]) => !skip.has(k))
     .map(([k,v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
@@ -1608,9 +1811,11 @@ function detail(d){
 // chunks legitimately land in different rooms.
 function docMatches(doc){
   if(!query) return true;
-  const q = query.toLowerCase();
-  if(doc.key.toLowerCase().includes(q)) return true;
-  return doc.ids.some(id => byId[id] && byId[id].content.toLowerCase().includes(q));
+  if(doc.key.toLowerCase().includes(query.toLowerCase())) return true;
+  // Whether any chunk in this document matches is answered server-side,
+  // alongside the drawer search — full chunk content isn't held client-side
+  // until the document is actually opened.
+  return docKeySet ? docKeySet.has(doc.key) : false;
 }
 
 function renderDocs(){
@@ -1627,8 +1832,6 @@ function renderDocs(){
     return;
   }
   c.innerHTML = crumb + hits.map((doc, i) => {
-    const first = byId[doc.ids[0]];
-    const prev = first ? first.content.slice(0, 200) : "";
     const where = doc.rooms.length > 1
       ? `${doc.wings.join(", ")} · ${doc.rooms.length} rooms`
       : `${doc.wings.join(", ")} / ${doc.rooms[0]}`;
@@ -1638,14 +1841,37 @@ function renderDocs(){
         ${doc.issues.length ? '<span class="pill" style="background:var(--warning)">order</span>' : ""}
         <span class="when">${when(doc.last)}</span></div>
       <div class="docmeta">${esc(where)} · ${bytes(doc.bytes)}</div>
-      <div class="prev">${hl(prev, query)}</div></div>`;
+      <div class="prev">${hl(doc.preview || "", query)}</div></div>`;
   }).join("");
   c.querySelectorAll(".card").forEach(el =>
     el.onclick = () => docDetail(hits[+el.dataset.d]));
   c.scrollTop = 0;
 }
 
-function docDetail(doc){
+// A document can be dozens of chunks — fetched together, on open, via
+// /api/document rather than carried in bulk for every document up front.
+async function docDetail(doc){
+  const c = document.getElementById("content");
+  const missing = doc.ids.some(id => !byId[id] || byId[id].content === undefined);
+  if(missing){
+    c.innerHTML = `<div class="empty">Loading…</div>`;
+    let full;
+    try {
+      const r = await fetch("/api/document?key=" + encodeURIComponent(doc.key));
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      full = await r.json();
+    } catch(e){
+      c.innerHTML = `<div class="empty">Could not load this document: ${esc(String(e))}</div>`;
+      return;
+    }
+    for(const ch of full.chunks){
+      byId[ch.id] = Object.assign(byId[ch.id] || {id: ch.id}, {content: ch.content, chunk_index: ch.chunk_index});
+    }
+  }
+  renderDocDetail(doc);
+}
+
+function renderDocDetail(doc){
   const c = document.getElementById("content");
   // Chunk seams stay visible. This is verbatim slices shown in order, not a
   // file we recovered — and each seam is a filing decision the miner made,
@@ -1868,6 +2094,7 @@ function renderChips(){
 }
 
 function render(){
+  listLimit = LIST_PAGE;   // any real navigation starts back at page one
   document.querySelectorAll(".view").forEach(b =>
     b.classList.toggle("sel", b.dataset.view === view));
   renderChips(); renderTree(); renderStats();
@@ -2061,6 +2288,16 @@ async function load(force){
     } else {
       lastSeen = stored;
     }
+
+    // Drop viewed-ids that no longer matter — either dropped from the palace,
+    // or no longer "new" anyway now that lastSeen has moved. Keeps this from
+    // growing without bound across a long-lived install.
+    for(const id of [...viewedNew]){
+      const dr = byId[id];
+      if(!dr || !(dr.filed_at > lastSeen)) viewedNew.delete(id);
+    }
+    localStorage.setItem(VIEWED_KEY, JSON.stringify([...viewedNew]));
+
     render();
     if(force){
       // An explicit Refresh is the "I've seen everything" signal.
@@ -2076,8 +2313,29 @@ async function load(force){
   }
 }
 
+// Search runs server-side (full drawer content lives there, not in the
+// browser) — debounced so typing doesn't fire a request per keystroke, and
+// guarded against out-of-order replies with a sequence number rather than
+// assuming responses land in request order.
+let searchTimer = null;
+async function runSearch(q){
+  const seq = ++searchSeq;
+  try {
+    const r = await fetch("/api/search?q=" + encodeURIComponent(q));
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if(seq !== searchSeq) return;   // a newer search has since started
+    searchHits = d.hits;
+    docKeySet = new Set(d.doc_keys);
+    for(const h of searchHits) byId[h.id] = Object.assign(byId[h.id] || {}, h);
+    render();
+  } catch(e){ /* leave the previous results on screen rather than blank it */ }
+}
 document.getElementById("q").addEventListener("input", e => {
-  query = e.target.value.trim(); render();
+  query = e.target.value.trim();
+  clearTimeout(searchTimer);
+  if(!query){ searchHits = null; docKeySet = null; render(); return; }
+  searchTimer = setTimeout(() => runSearch(query), 150);
 });
 document.getElementById("btnRefresh").onclick = () => load(true);
 document.querySelectorAll(".view").forEach(b => b.onclick = () => {
