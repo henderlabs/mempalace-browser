@@ -40,6 +40,20 @@ checked at all. It never shows green while a warning is live.
 **Host** *(opt-in)* — CPU load and memory for the machine, if you want them. See
 [Configuration](#configuration).
 
+## New in 0.4: trust, a map of meaning, and a safe updater
+
+**Galaxy** — a third view: every drawer is a dot placed by *meaning*, read from the vectors MemPalace already stored (no model is loaded, nothing is written). Colour by wing, age or author; hover for a summary; *Show on map* lights a drawer's neighbours; replay history; a privacy mode hides text. Overlays: **staleness** (fades what has not been touched lately, from the revision log), **supersede chains** (a drawer that says it replaces another, marked as stated or inferred), **possible conflicts** (very close drawers that state the same kind of value differently: a heuristic, never a verdict) and **cluster summaries**.
+
+**Re-file plan** — a read-only audit that suggests, with reasons and confidence, where drawers belong, and exports a plan (JSON, with a text checksum per drawer) for an agent or a person to review. The browser never applies it.
+
+**Trust panel** — which service you are talking to, SQLite integrity, and the age of your newest backup (`MPB_BACKUP_GLOBS`).
+
+**Secret-looking text** — masked warnings for credential-shaped text in drawers and in old versions in the revision log. Previews, tooltips and titles mask credential-shaped identifiers (a courtesy by pattern, not a vault: it will miss shapes it does not know).
+
+**Palace audit and History** — MemPalace's own organisation score with a command beside each finding, and the earlier versions of any drawer.
+
+**Updater** — the browser tells you when a newer release exists and never installs it. See [Updating](#updating).
+
 ## Warnings come with a fix
 
 When something is wrong, the browser tells you **what is wrong, why it matters, what to run, how
@@ -57,7 +71,7 @@ worse than none when the wrong guess deletes drawers.
 
 ## Status
 
-Working and in daily use. Best-effort maintenance: issues and PRs are welcome, but no support or
+Working and in daily use. Tested with MemPalace **3.12.0**: the integrity probe and the audit call importable package functions that are not documented public APIs, so other versions may differ. Best-effort maintenance: issues and PRs are welcome, but no support or
 response time is promised. See [Contributing](#contributing).
 
 ## Requirements
@@ -96,7 +110,12 @@ Everything is optional. Defaults are chosen so that running it with no configura
 | `MPB_BIND` | `127.0.0.1` | Interface to bind. **See [Security](#security) before changing this.** |
 | `MPB_PORT` | `8080` | Port to listen on |
 | `MPB_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Extra `Host` headers to accept, comma-separated. Needed if you reach it by a hostname — e.g. `MPB_ALLOWED_HOSTS=palace.lan` |
-| `MPB_CHECK_UPDATES` | `1` | `0` disables the PyPI version check — see [Network](#network) |
+| `MPB_CHECK_UPDATES` | `1` | `0` disables both update checks (PyPI for MemPalace, GitHub for this browser) — see [Network](#network) |
+| `MPB_RELEASES_URL` | this repo's latest-release API | Where the browser looks for its own updates |
+| `MPB_UPDATE_CHANNEL` | `stable` | `prerelease` also considers pre-releases |
+| `MPB_BACKUP_GLOBS` | *(unset)* | Comma-separated globs of your backups; enables the "last backup" row and backup-age findings. Files are only `stat`ed, never opened. Unset, the panel says "unknown" |
+| `MPB_SECRET_SCAN` | `1` | `0` turns the secret-looking-text scan off |
+| `MPB_SECRET_ALLOW` | *(empty)* | Comma-separated drawer ids to stop flagging |
 | `MPB_DEMO` | *(off)* | `1` renders synthetic drawers and never imports MemPalace |
 | `MPB_RESOURCES` | *(off)* | `1` shows host CPU load and memory. Worth it on a box dedicated to MemPalace — the embedder loads a model into RAM and the vector index lives there too, so RAM runs out before disk does. On a shared box the numbers describe everything except your palace. Linux only; elsewhere it reports *unavailable*. |
 | `MEMPALACE_PYTHON` | *(auto-detected)* | Interpreter to use, if auto-detection picks wrong |
@@ -106,10 +125,11 @@ The palace itself is located by asking MemPalace, so `MEMPALACE_PALACE_PATH` and
 
 ## Network
 
-**One outbound request, and you can turn it off.** On startup the browser fetches
-`https://pypi.org/pypi/mempalace/json` to see whether a newer MemPalace has been released. It
-sends **no palace data** — it reads one version string from a fixed URL. The result is cached for
-an hour.
+**Two outbound requests, and you can turn both off.** The browser fetches
+`https://pypi.org/pypi/mempalace/json` to see whether a newer MemPalace has been released (cached
+for an hour), and the latest-release page of this repository on GitHub to see whether a newer
+MemPalace Browser exists (cached for six hours; a failed check is retried after fifteen minutes).
+Neither sends **any palace data**: each reads a version string from a fixed URL.
 
 ```bash
 MPB_CHECK_UPDATES=0 ./run.sh    # no outbound requests at all
@@ -118,8 +138,44 @@ MPB_CHECK_UPDATES=0 ./run.sh    # no outbound requests at all
 The version chip then reads *"update check off"* rather than implying anything about your version.
 Demo mode disables it by default.
 
-There is no telemetry, no analytics, and no other outbound traffic. If you see any, that is a bug
+`MPB_RELEASES_URL` changes where the second check looks. There is no telemetry, no analytics, and no other outbound traffic. If you see any, that is a bug
 — please [report it](SECURITY.md).
+
+## Running it as a service
+
+A systemd user unit (`~/.config/systemd/user/mempalace-browser.service`):
+
+```ini
+[Unit]
+Description=MemPalace Browser (read-only web UI)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mempalace-browser
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=MPB_PORT=8080
+ExecStart=%h/mempalace-browser/run.sh
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user daemon-reload && systemctl --user enable --now mempalace-browser`.
+
+## Updating
+
+The browser never updates itself: a program that can replace its own code is a supply-chain risk. It only reports that a release exists. To update, run the script yourself:
+
+```bash
+./update.sh --check                          # what is installed, what is the latest release
+./update.sh --unit mempalace-browser         # download, verify, back up, swap, restart, health-check
+./update.sh --rollback --unit mempalace-browser
+```
+
+`update.sh` downloads `app.py` and `SHA256SUMS` from the latest release and stops if the checksum, the compile check or the version inside the file does not match. It keeps a backup, restarts, and confirms `/api/health` answers with a drawer count that has not collapsed; if not, it puts the old file back. It will not install an older release unless you pass `--allow-downgrade`. Open the page once afterwards and look at it before you trust it.
 
 ## Security
 
@@ -153,6 +209,10 @@ MPB_ALLOWED_HOSTS=palace.lan ./run.sh
 A rejected request logs the exact variable to set, so a 403 tells you what to do rather than
 leaving you guessing.
 
+**Do not port-forward this to the internet.** It has no login.
+
+**Old text survives edits.** MemPalace keeps a revision log. Redacting or editing a drawer does not remove an earlier version from the log, from backups, or from archives of them. If the secret scan reports credential-shaped text that survives only in old versions, rotate the credential first; cleaning the copies is a separate job.
+
 ## Backends
 
 Drawer browsing is backend-agnostic — it goes through MemPalace's own collection API.
@@ -166,7 +226,7 @@ Drawer browsing is backend-agnostic — it goes through MemPalace's own collecti
 
 On remote backends the storage panel says so rather than reporting misleading local disk numbers.
 
-Checked against MemPalace **3.5.0**, the current release. Upstream's `develop` branch adds a
+Checked against MemPalace **3.12.0**. Upstream's `develop` branch adds a
 `milvus` backend for 3.6.0 — when that ships, drawer browsing should work untouched (it goes
 through MemPalace's own collection API), but Milvus Lite is *local*, so the storage panel will
 need teaching about it rather than calling it remote.
@@ -197,8 +257,9 @@ palace cannot be read. A health check that cannot fail is not a health check.
 - **No semantic search.** Search is instant client-side text matching over every drawer. Real
   semantic search would mean loading the embedding model and a slow startup; text matching is
   usually what you want when *you* are the one looking.
-- **No graph or 3D view.** If you want those, see
+- **No knowledge-graph or 3D view.** The Galaxy is a flat map of drawers and does not draw knowledge-graph facts. If you want a graph or 3D view, see
   [memory-palace-web-frontend](https://github.com/tomsalphaclawbot/memory-palace-web-frontend).
+- **No applying plans.** The re-file plan and the audit are reports. The browser never moves, edits or deletes anything.
 
 ## Contributing
 
@@ -210,6 +271,8 @@ Security issues go through [private reporting](SECURITY.md), not public issues.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+If `mempalace` is importable with the Python you run it with, one extra test checks that an empty palace path is refused rather than served. (Opening such a path can leave an empty `chroma.sqlite3` behind: the vector store creates its own file before MemPalace reports "no collection". The browser still refuses to start and says so.)
 
 ## License
 
