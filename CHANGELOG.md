@@ -1,6 +1,14 @@
 # MemPalace Browser — changelog
 
-Previous release: 0.3.0.
+## [0.4.1] — 2026-11-24
+
+### Changed
+- **Richer demo.** `MPB_DEMO=1` now shows 150 synthetic drawers in four wings and eleven rooms (it was nine drawers), so the Galaxy has something to show: clusters that overlap, 20 drawers that sit between two topics, 56 short daily-log entries that fill the space between wings, and three drawers that say they replace an older one. Still synthetic and deterministic; real vectors are never shown in a demo.
+- **Docs.** README screenshot replaced with the 0.4 interface. `SECURITY.md` and the pull-request template now name both outbound version checks (PyPI and the GitHub release check). The CI matrix runs on `ubuntu-24.04` so the Python 3.9 job can run.
+
+No change to the browser's behaviour on a real palace.
+
+Previous release: 0.4.0 (below).
 
 ## [0.4.0] — 2026-11-23
 

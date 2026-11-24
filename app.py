@@ -53,7 +53,7 @@ PORT = int(os.environ.get("MPB_PORT", "8080"))
 # in the header reports MemPalace's version, because that is the number a user
 # is actually asking about, and conflating the two is how a browser ends up
 # claiming its host library is out of date.
-MPB_VERSION = "0.4.0"
+MPB_VERSION = "0.4.1"
 REPO_URL = "https://github.com/henderlabs/mempalace-browser"
 
 
@@ -807,13 +807,27 @@ def galaxy_info():
     arr = array.array("f")
     ids = []
     if DEMO:
-        # Synthetic clusters, one centre per wing: real vectors are never shown in a demo.
+        # Synthetic clusters: one centre per wing, a smaller one per room inside it, and a drawer that
+        # replaces another sits right beside it. Real vectors are never shown in a demo.
         import random
         rng = random.Random(7)
-        dim, centres = 48, {}
+        dim, wc, rc, vec = 48, {}, {}, {}
         for d in _demo_drawers():
-            c = centres.setdefault(d["wing"], [rng.gauss(0, 1) for _ in range(dim)])
-            arr.extend([c[k] + rng.gauss(0, 0.9) for k in range(dim)])
+            w = wc.setdefault(d["wing"], [rng.gauss(0, 1.0) for _ in range(dim)])
+            r = rc.setdefault((d["wing"], d["room"]), [rng.gauss(0, 0.9) for _ in range(dim)])
+            near, pull = _DEMO_NEAR.get(d["id"]), _DEMO_PULL.get(d["id"])
+            if near:
+                v = [x + rng.gauss(0, 0.12) for x in vec[near]]
+            elif pull:
+                ow = wc.setdefault(pull[0], [rng.gauss(0, 1.0) for _ in range(dim)])
+                orr = rc.setdefault(pull, [rng.gauss(0, 0.9) for _ in range(dim)])
+                v = [0.5 * (w[k] + r[k]) + 0.5 * (ow[k] + orr[k]) + rng.gauss(0, 0.35) for k in range(dim)]
+            elif d["room"] == "log":
+                v = [w[k] + rng.gauss(0, 0.85) for k in range(dim)]
+            else:
+                v = [w[k] + r[k] + rng.gauss(0, 0.6) for k in range(dim)]
+            vec[d["id"]] = v
+            arr.extend(v)
             ids.append(d["id"])
     else:
         with warnings.catch_warnings():
@@ -1163,59 +1177,270 @@ _palace_lock = threading.Lock()
 _palace_notes_seen = []
 
 
+# Synthetic palace for MPB_DEMO=1. Four wings, eleven rooms, about ninety drawers, so the map has
+# shape: each room is a cluster inside its wing, and a few drawers say they replace an older one.
+# (wing, room, days ago, title, body[, title of the older drawer this one replaces])
+_DEMO_SPEC = [
+    ("Orchard", "decisions", 1, "Chose SQLite over Postgres for the ledger",
+     "The ledger is single-writer and under a gigabyte. Postgres would add an operational dependency to a program that otherwise has none. Revisit if concurrent writers ever appear. Decided after the March load test showed 40x headroom."),
+    ("Orchard", "decisions", 96, "Rejected the plugin architecture",
+     "Two plugins existed and both were written by us. The abstraction cost more than it saved. Deleted 900 lines; behaviour unchanged."),
+    ("Orchard", "decisions", 214, "One config file, no environment cascade",
+     "Settings come from one file plus a handful of environment overrides. Three layers of defaults made every bug a hunt for which layer won."),
+    ("Orchard", "decisions", 180, "Retry policy for the sync job",
+     "Retry three times with a one-second pause, then give up and log. Failing loudly beats retrying for an hour."),
+    ("Orchard", "decisions", 33, "Retry policy for the sync job, revised",
+     "Supersedes the {old} note. Retry five times with exponential backoff, capped at one minute, and alert after the fifth failure.", "Retry policy for the sync job"),
+    ("Orchard", "decisions", 150, "Log format",
+     "One JSON object per line, UTC timestamps, no multi-line messages. Easy to grep, easy to ship later."),
+    ("Orchard", "decisions", 270, "Naming: nouns for things, verbs for jobs",
+     "Tables and services are nouns, scheduled jobs are verbs. A name that needs a comment is the wrong name."),
+    ("Orchard", "decisions", 122, "Pin the base image by digest",
+     "A tag can move under you. A digest cannot. Renovate bumps it weekly and the diff shows what changed."),
+    ("Orchard", "deploy", 4, "Deploy is a git archive of the SHA",
+     "The image tag IS the commit SHA, so a running container always names the source it came from. No `latest`, ever."),
+    ("Orchard", "deploy", 38, "Postmortem: the health check that could not fail",
+     "The status endpoint returned 200 with the error text in the body, so monitoring saw a healthy service for six weeks. A health check that cannot fail is not a health check."),
+    ("Orchard", "deploy", 61, "Rollback is a redeploy of the previous SHA",
+     "There is no special rollback path. Deploying the old SHA exercises the same code as every other deploy, so it is the path that is tested."),
+    ("Orchard", "deploy", 90, "Deploy window",
+     "Weekdays before 15:00. Nothing on Fridays. The rule exists because of one Friday."),
+    ("Orchard", "deploy", 12, "Deploy window, relaxed",
+     "Supersedes the {old} note. Fridays are allowed again for changes behind a flag, since flags can be turned off without a deploy.", "Deploy window"),
+    ("Orchard", "deploy", 200, "Smoke test after every deploy",
+     "Three requests: health, a read, a write to a scratch record. If any fails the deploy is rolled back automatically."),
+    ("Orchard", "deploy", 240, "Build cache is not a source of truth",
+     "A clean build once a week catches the things the cache was hiding."),
+    ("Orchard", "incidents", 27, "Disk filled by debug logging",
+     "Debug logging was left on after a test and filled the volume in nine days. Log rotation now caps it, and debug has to be switched on per run."),
+    ("Orchard", "incidents", 74, "Expired certificate",
+     "The renewal job ran but nobody read its output. It now fails loudly and pages on any non-zero exit."),
+    ("Orchard", "incidents", 118, "DNS change took longer than expected",
+     "The record had a one-day TTL that nobody remembered setting. Lower the TTL a day before any planned move."),
+    ("Orchard", "incidents", 165, "Backup restored empty",
+     "The backup job succeeded and the file was 4 KB. A backup is not a backup until a restore has been tested and the count checked."),
+    ("Orchard", "incidents", 205, "Clock drift",
+     "Two hosts disagreed by 40 seconds and token validation failed intermittently. Every host now syncs time at boot and on a timer."),
+    ("Orchard", "incidents", 8, "Queue backed up overnight",
+     "One malformed message was retried forever and blocked the line. Poison messages now go to a side queue after three tries."),
+    ("Orchard", "incidents", 315, "The migration that locked the table",
+     "An index build held a lock for eleven minutes. Build indexes concurrently, off hours, and measure on a copy first."),
+    ("Greenhouse", "notes", 12, "Watering schedule",
+     "Tomatoes every other day, deeply, in the morning. Basil daily. The rosemary wants to be forgotten about."),
+    ("Greenhouse", "notes", 158, "Seed order arrived",
+     "Heirloom tomato, two varieties of basil, and the pepper seeds that never germinate but hope springs eternal."),
+    ("Greenhouse", "notes", 20, "Vent opens at 22 degrees",
+     "The automatic vent opener is set to 22 degrees. Anything higher and the leaves scorch by afternoon."),
+    ("Greenhouse", "notes", 6, "Vent opens at 26 degrees",
+     "Supersedes the {old} note. The vent opener is now set to 26 degrees: 22 opened too early in spring and let the heat out.", "Vent opens at 22 degrees"),
+    ("Greenhouse", "notes", 47, "Frost night",
+     "Covered the tender plants and ran the small heater. Minimum was 1 degree. Nothing lost."),
+    ("Greenhouse", "notes", 95, "Shade cloth",
+     "Fitted 40 percent shade cloth over the south side in June. Cooler by about four degrees at midday."),
+    ("Greenhouse", "notes", 230, "Bench layout",
+     "Tall plants to the north so they do not shade the rest. Seedlings on the warm bench by the door."),
+    ("Greenhouse", "notes", 300, "Rain barrel",
+     "Two barrels, linked. Holds about a month of watering in a dry spell. Check the overflow before winter."),
+    ("Greenhouse", "seeds", 140, "Tomato varieties",
+     "Brandywine for flavour, Sungold for volume, Roma for sauce. Start indoors in late February."),
+    ("Greenhouse", "seeds", 133, "Germination temperatures",
+     "Peppers want 26 to 29 degrees to sprout and a heat mat helps. Lettuce sulks above 24."),
+    ("Greenhouse", "seeds", 128, "Saving seed",
+     "Beans and peas save true and easily. Squash cross freely, so only save from an isolated plant."),
+    ("Greenhouse", "seeds", 110, "Seed storage",
+     "Paper envelopes in a jar with silica gel, in the fridge door. Label with the year."),
+    ("Greenhouse", "seeds", 187, "Sowing calendar",
+     "Peppers and tomatoes February, brassicas March, beans only after the last frost in May."),
+    ("Greenhouse", "seeds", 250, "Seed order list",
+     "Two basils, one cilantro that will bolt anyway, dill, and a packet of something odd to try."),
+    ("Greenhouse", "pests", 55, "Aphids on the peppers",
+     "A strong jet of water, then insecticidal soap every third day for two weeks. Ladybirds help if you leave them alone."),
+    ("Greenhouse", "pests", 80, "Whitefly",
+     "Yellow sticky cards by the door catch them early. Check the underside of tomato leaves weekly."),
+    ("Greenhouse", "pests", 105, "Slugs at the seedling bench",
+     "Copper tape around the legs and a saucer of beer. Go out after dark with a torch if it gets bad."),
+    ("Greenhouse", "pests", 170, "Blossom end rot",
+     "Not a pest: uneven watering stops calcium reaching the fruit. Water steadily and mulch."),
+    ("Greenhouse", "pests", 15, "Spider mites",
+     "Hot and dry brings them. Mist the undersides, raise the humidity, and isolate anything with webbing."),
+    ("Workshop", "reference", 67, "Torque values",
+     "Aluminium: go slow, and stop the moment it stops feeling like it is tightening. The thread will not warn you twice."),
+    ("Workshop", "reference", 205, "Sharpening angles",
+     "Kitchen knives 15 degrees per side. Chisels 25. The angle matters less than being consistent about it."),
+    ("Workshop", "reference", 40, "Drill sizes for tapping",
+     "M6 needs a 5 mm drill, M8 a 6.8, M10 an 8.5. Use cutting fluid and back the tap off every half turn."),
+    ("Workshop", "reference", 160, "Wood glue open times",
+     "Yellow glue gives about ten minutes of open time, less in a warm shop. Do the dry fit first, always."),
+    ("Workshop", "reference", 225, "Screw pilot holes",
+     "Pilot at the root diameter for hardwood, a little smaller for softwood. Countersink before driving."),
+    ("Workshop", "reference", 100, "Finishing schedule",
+     "Sand to 220, raise the grain with a damp cloth, sand again, then oil. Three coats, a day apart."),
+    ("Workshop", "reference", 290, "Metric and imperial cross-reference",
+     "25.4 mm to the inch. A 3/8 drill is 9.5 mm, close enough that it matters only when it matters."),
+    ("Workshop", "projects", 250, "Bench rebuild",
+     "The top is cupped about 3mm across the width. Flatten with winding sticks before adding the vice, not after."),
+    ("Workshop", "projects", 35, "Shelves for the garage",
+     "Four uprights, six shelves, 18 mm ply. Notch the uprights rather than relying on screws alone."),
+    ("Workshop", "projects", 85, "Potting bench",
+     "Cedar top, galvanised legs. Built to the height of the elbow, which is lower than the shop bench."),
+    ("Workshop", "projects", 130, "Cold frame",
+     "Old window on a treated frame, hinged at the back. Prop it open on any day above ten degrees."),
+    ("Workshop", "projects", 195, "Drawer slides",
+     "Full extension, 450 mm. Mount the cabinet side first and use a spacer block to keep both sides level."),
+    ("Workshop", "projects", 260, "Dovetail practice",
+     "Twenty joints in pine before touching the good wood. The first ten were bad. The next ten were less bad."),
+    ("Workshop", "tools", 22, "Hand plane tune-up",
+     "Flatten the sole, hone the iron to 25 degrees, set the cap iron close. It should take a shaving you can read through."),
+    ("Workshop", "tools", 70, "Table saw safety",
+     "Riving knife on, push stick in hand, stand out of the line of the blade. Never reach over a running blade."),
+    ("Workshop", "tools", 115, "Dust collection",
+     "A cyclone separator ahead of the shop vac. The filter lasts ten times longer and the hose stops clogging."),
+    ("Workshop", "tools", 175, "Router bits",
+     "Keep the good bits in a block, not a drawer. Clean pitch off with a solvent, not a scraper."),
+    ("Workshop", "tools", 245, "Drill press speeds",
+     "Slow for big bits and metal, fast for small bits and wood. Clamp the work, never hold it."),
+    ("Workshop", "tools", 320, "Measuring and marking",
+     "Marking knife over pencil for joinery. Measure from one end, always the same end."),
+    # Bridges: notes that belong to two topics at once. They land between clusters on the map.
+    ("Greenhouse", "notes", 24, "Cold frame from the old windows",
+     "The cold frame in the garden is built from two salvaged window sashes and a treated frame. Hinged at the back, propped open above ten degrees.", ("Workshop", "projects")),
+    ("Workshop", "projects", 26, "Potting bench height for seedlings",
+     "Built the potting bench to elbow height so the seedling trays from the greenhouse can be handled without bending.", ("Greenhouse", "seeds")),
+    ("Kitchen", "preserving", 31, "Tomatoes from the greenhouse, canned",
+     "Sungold and Roma from the greenhouse bench went into the water bath: 45 minutes for pints, a spoon of lemon juice in each jar.", ("Greenhouse", "seeds")),
+    ("Greenhouse", "seeds", 39, "Basil for the freezer cubes",
+     "Grow two rows of basil for the kitchen: it freezes well in olive oil cubes and the plants keep producing if cut often.", ("Kitchen", "preserving")),
+    ("Kitchen", "recipes", 44, "Sauce from the first ripe tomatoes",
+     "First ripe Brandywine of the season went straight into the sauce with garlic and basil from the greenhouse. Half an hour, no more.", ("Greenhouse", "notes")),
+    ("Orchard", "deploy", 49, "Deploys checked like a recipe",
+     "Wrote the deploy as a checklist in the kitchen-recipe style: ingredients (the SHA, the config), steps, and how it should look when it is done.", ("Kitchen", "recipes")),
+    ("Orchard", "incidents", 53, "Backups: test the restore, like tasting the jam",
+     "A backup is like jam: you find out whether it set only when you open it. Schedule a restore test and check the count.", ("Kitchen", "preserving")),
+    ("Workshop", "tools", 57, "Dust collection for the sanding table",
+     "A cyclone ahead of the shop vac, and a log of when the filter was last cleaned so it is a routine, like the deploy runbook.", ("Orchard", "deploy")),
+    ("Orchard", "decisions", 62, "Keep the shop notes in plain files",
+     "The workshop notes stay as plain text files, backed up with everything else. No new tool for a few dozen pages.", ("Workshop", "reference")),
+    ("Greenhouse", "pests", 66, "Slug trap from a spare yoghurt pot",
+     "Sunk a pot in the soil and filled it with beer. It cost nothing and caught more than the copper tape.", ("Kitchen", "recipes")),
+    ("Workshop", "reference", 72, "Torque for greenhouse hinges",
+     "Aluminium greenhouse hinges: snug, not tight. Go slow and stop the moment it feels like it is tightening.", ("Greenhouse", "notes")),
+    ("Kitchen", "preserving", 77, "Jar labels and the pantry list",
+     "A label on every jar and one list in the pantry door. It is the same discipline as naming things in the code.", ("Orchard", "decisions")),
+    ("Orchard", "incidents", 84, "Heat spike in the server cupboard",
+     "The cupboard hit 38 degrees. Vented it like the greenhouse: a thermostat fan at 26 and a temperature alert.", ("Greenhouse", "notes")),
+    ("Workshop", "projects", 92, "Pie safe for the kitchen",
+     "Built a small cupboard with a mesh door for cooling pies and bread. Cherry, with a sanded oil finish.", ("Kitchen", "recipes")),
+    ("Greenhouse", "notes", 98, "Greenhouse log: what I would do differently",
+     "Fewer varieties, more of each. Keep a decision list the way the code projects do: what was chosen, and why.", ("Orchard", "decisions")),
+    ("Kitchen", "recipes", 104, "Roast tomatoes with herbs",
+     "Halve the tomatoes, olive oil, thyme from the pot by the door, 160 degrees for two hours. Keep in oil in the fridge.", ("Greenhouse", "seeds")),
+    ("Workshop", "tools", 109, "Sharpening stones next to the knife block",
+     "The fine stone lives in the kitchen drawer now: kitchen knives at 15 degrees, chisels in the shop at 25.", ("Kitchen", "recipes")),
+    ("Orchard", "deploy", 113, "Pin versions like you pin a recipe",
+     "Name the exact flour, the exact image digest. Reproducible results come from fixed inputs, in bread and in builds.", ("Kitchen", "recipes")),
+    ("Greenhouse", "pests", 120, "Pest log as a table",
+     "Keep the pest notes in one small table: date, what, what was tried, whether it worked. Like the incident log, without the blame.", ("Orchard", "incidents")),
+    ("Workshop", "reference", 135, "Moisture content before gluing",
+     "Wood from the garden shed needs two weeks inside before gluing. Check with a meter; do not trust the feel.", ("Greenhouse", "notes")),
+    ("Kitchen", "recipes", 10, "Sourdough, weekly loaf",
+     "500 g flour, 350 g water, 100 g starter, 10 g salt. Fold every thirty minutes for two hours, then proof overnight in the fridge."),
+    ("Kitchen", "recipes", 29, "Tomato sauce",
+     "Garlic in olive oil, a tin of tomatoes, salt, and half an hour. Basil at the end, never the beginning."),
+    ("Kitchen", "recipes", 58, "Roast chicken",
+     "Salt it the day before and leave it uncovered in the fridge. 220 degrees for the first twenty minutes, then 180."),
+    ("Kitchen", "recipes", 83, "Chili for a crowd",
+     "Two kinds of beans, one kind of chile, and the patience to cook it for three hours. Better on the second day."),
+    ("Kitchen", "recipes", 112, "Pickled onions",
+     "Equal parts vinegar and water, a spoon of sugar, a spoon of salt. Ready in an hour, best after a week."),
+    ("Kitchen", "recipes", 147, "Pancakes",
+     "Rest the batter for ten minutes. The first one is always a sacrifice to the pan."),
+    ("Kitchen", "recipes", 199, "Pie crust",
+     "Cold butter, cold water, as little handling as possible. Rest it before rolling or it fights back."),
+    ("Kitchen", "preserving", 18, "Tomato canning",
+     "Water bath for 45 minutes for pints. Add a spoon of lemon juice to each jar so the acidity is safe."),
+    ("Kitchen", "preserving", 52, "Jam set test",
+     "A spoonful on a cold plate. Push it with a finger: if it wrinkles, it is done."),
+    ("Kitchen", "preserving", 91, "Freezing herbs",
+     "Chop, pack into an ice-cube tray, cover with olive oil, freeze, and bag the cubes."),
+    ("Kitchen", "preserving", 126, "Fermented hot sauce",
+     "Five percent salt by weight of peppers and water. Ten days on the counter, then blend. Keep it under the brine."),
+    ("Kitchen", "preserving", 168, "Dried apples",
+     "Thin slices, 60 degrees for six hours, until leathery with no wet spots. Store airtight."),
+    ("Kitchen", "preserving", 210, "Pantry rotation",
+     "Newest to the back, oldest to the front, and a date on every jar."),
+    ("Kitchen", "preserving", 280, "Pressure canner, first time",
+     "Read the manual twice. Vent for ten minutes before closing. Never open it until the pressure is at zero."),
+]
+
+
+_DEMO_LOG = {
+    "Orchard": ["Deployed {sha}; smoke test green.", "Rotated the log files, 2 GB freed.", "Reviewed the retry settings; left as they were.",
+                "Backup restored cleanly in a scratch copy.", "Renewed the certificate, expires in 89 days.", "Cleared the dead-letter queue: 3 messages.",
+                "Dependency bump merged, nothing changed.", "Checked the dashboards: flat and boring, which is good."],
+    "Greenhouse": ["Watered the tomatoes, picked the first {n} Sungold.", "Vents opened at 08:40, closed at 18:10.", "Tied in the cucumbers.",
+                   "Pinched out the basil flowers.", "Checked the sticky cards: {n} whitefly.", "Thinned the lettuce to a hand's width.",
+                   "Fed the peppers with seaweed feed.", "Moved the seedlings to the cold bench."],
+    "Workshop": ["Planed the shelf boards, {n} passes each.", "Glued up the panel, clamped overnight.", "Sharpened the plane iron and the chisels.",
+                 "Swept the shop and emptied the dust bin.", "Cut the dovetails for the drawer front.", "Oiled the bench top, first coat.",
+                 "Squared the end of the board on the shooting board.", "Ordered {n} metres of edge banding."],
+    "Kitchen": ["Fed the starter, baked the weekly loaf.", "Made {n} jars of jam; they set.", "Roasted a chicken, stock on the stove for tomorrow.",
+                "Labelled and shelved the pickles.", "Tried a new chili: more cumin next time.", "Froze the surplus herbs in oil.",
+                "Cleaned the oven, finally.", "Pancakes for breakfast; the first one was the sacrifice."],
+}
+
+
+def _demo_logs(now):
+    import random
+    rng = random.Random(11)
+    rows = []
+    for wing, lines in _DEMO_LOG.items():
+        for k in range(14):
+            days = rng.randint(1, 330)
+            text = rng.choice(lines).format(sha=hashlib.md5(f"{wing}{k}".encode()).hexdigest()[:7], n=rng.randint(2, 9))
+            rows.append((wing, "log", days, "Log " + (now - timedelta(days=days)).strftime("%Y-%m-%d"), text))
+    return rows
+
+
 def _demo_drawers():
     """Obviously-synthetic drawers. Nothing here is anyone's real memory."""
+    global _DEMO_NEAR
     now = datetime.now(timezone.utc)
-    spec = [
-        ("Orchard", "decisions", 1, "sample-decisions.md",
-         "# Chose SQLite over Postgres for the ledger\n\nThe ledger is single-writer and "
-         "under a gigabyte. Postgres would add an operational dependency to a program "
-         "that otherwise has none. Revisit if concurrent writers ever appear.\n\n"
-         "Decided after the March load test showed 40x headroom."),
-        ("Orchard", "decisions", 96, "sample-decisions.md",
-         "# Rejected the plugin architecture\n\nTwo plugins existed and both were written "
-         "by us. The abstraction cost more than it saved. Deleted 900 lines; behaviour "
-         "unchanged."),
-        ("Orchard", "deploy", 4, "sample-deploy.md",
-         "# Deploy is a git archive of the SHA\n\nThe image tag IS the commit SHA, so a "
-         "running container always names the source it came from. No `latest`, ever."),
-        ("Orchard", "deploy", 38, "sample-deploy.md",
-         "# Postmortem: the health check that could not fail\n\nThe status endpoint "
-         "returned 200 with the error text in the body, so monitoring saw a healthy "
-         "service for six weeks. A health check that cannot fail is not a health check."),
-        ("Greenhouse", "notes", 12, "sample-notes.md",
-         "# Watering schedule\n\nTomatoes every other day, deeply, in the morning. "
-         "Basil daily. The rosemary wants to be forgotten about."),
-        ("Greenhouse", "notes", 158, "sample-notes.md",
-         "# Seed order arrived\n\nHeirloom tomato, two varieties of basil, and the "
-         "pepper seeds that never germinate but hope springs eternal."),
-        ("Workshop", "reference", 67, "sample-reference.md",
-         "# Torque values\n\nAluminium: go slow, and stop the moment it stops feeling "
-         "like it is tightening. The thread will not warn you twice."),
-        ("Workshop", "reference", 205, "sample-reference.md",
-         "# Sharpening angles\n\nKitchen knives 15 degrees per side. Chisels 25. "
-         "The angle matters less than being consistent about it."),
-        ("Workshop", "projects", 250, "sample-projects.md",
-         "# Bench rebuild\n\nThe top is cupped about 3mm across the width. Flatten with "
-         "winding sticks before adding the vice, not after."),
-    ]
-    out = []
-    seq = Counter()
-    for wing, room, days_ago, src, content in spec:
+    out, seq, by_title = [], Counter(), {}
+    _DEMO_NEAR = {}
+    _DEMO_PULL.clear()
+    for row in list(_DEMO_SPEC) + _demo_logs(now):
+        wing, room, days_ago, title, body = row[:5]
+        extra = row[5] if len(row) > 5 else None
+        older = extra if isinstance(extra, str) else None
+        src = f"sample-{room}.md"
+        if older:
+            o = by_title[older]
+            body = body.format(old=datetime.fromisoformat(o["filed_at"]).strftime("%Y-%m-%d"))
+        content = f"# {title}\n\n{body}"
         filed = (now - timedelta(days=days_ago)).isoformat(timespec="microseconds")
-        # Number the chunks per source file, the way a real mine does — it is
+        # Number the chunks per source file, the way a real mine does: it is
         # what makes the Documents view demonstrate anything.
         ci = seq[src]
         seq[src] += 1
-        out.append({
-            "id": f"drawer_{wing}_{room}_{abs(hash((wing, room, content))) % (16**24):024x}",
-            "wing": wing, "room": room, "filed_at": filed,
+        did = f"drawer_{wing}_{room}_" + hashlib.md5((content + str(days_ago) + str(len(out))).encode()).hexdigest()[:24]
+        d = {
+            "id": did, "wing": wing, "room": room, "filed_at": filed,
             "added_by": "demo", "source_file": src, "chunk_index": ci,
             "content": content, "bytes": len(content.encode("utf-8")),
             "meta": {"wing": wing, "room": room, "filed_at": filed,
                      "added_by": "demo", "source_file": src, "chunk_index": str(ci)},
-        })
+        }
+        by_title[title] = d
+        if isinstance(extra, tuple):
+            _DEMO_PULL[did] = extra
+        if older:
+            _DEMO_NEAR[did] = by_title[older]["id"]
+        out.append(d)
     return out
+
+
+_DEMO_NEAR = {}
+_DEMO_PULL = {}
 
 
 def read_palace(force=False):
