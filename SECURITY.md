@@ -41,9 +41,10 @@ whole network.** That is documented, not a vulnerability. Do not report it as on
 `PATCH`, or `DELETE` handler exists. A path that writes to or mutates a palace
 *is* a bug, and a serious one — please report it.
 
-**The one outbound request** is a version check against a fixed `pypi.org` URL.
-It sends no palace data. Disable it with `MPB_CHECK_UPDATES=0`. Any other
-outbound traffic is a bug — please report it.
+**There are two outbound requests**, both version checks against fixed URLs: `pypi.org`
+(is a newer MemPalace out?) and this repository's latest GitHub release (is a newer
+MemPalace Browser out?). Neither sends palace data. Disable both with
+`MPB_CHECK_UPDATES=0`. Any other outbound traffic is a bug — please report it.
 
 ## In scope
 
@@ -51,7 +52,7 @@ outbound traffic is a bug — please report it.
 - Host allow-list bypasses
 - XSS via drawer content, metadata, or the `Host` header
 - Any write path to the palace
-- Any outbound request other than the documented PyPI check
+- Any outbound request other than the two documented version checks (PyPI and the GitHub release check)
 
 ## Not in scope
 

@@ -14,5 +14,5 @@
 
 - [ ] Adds no dependency, build step, or `requirements.txt`
 - [ ] Adds no write path to the palace (`create=False` everywhere)
-- [ ] Adds no outbound request beyond the documented PyPI version check
+- [ ] Adds no outbound request beyond the two documented version checks (PyPI and the GitHub release check)
 - [ ] Touches the `Host` allow-list / escaping / read-only guarantee? → a test covers it

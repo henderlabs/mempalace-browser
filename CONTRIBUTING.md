@@ -32,7 +32,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 They run the real server in demo mode, so they need no MemPalace, no vector
-database, and no palace. If you add a test that needs any of those, that is a
+database, and no palace. (One extra test runs only if `mempalace` is importable:
+it checks that an empty palace path is refused.) If you add a test that needs any of those, that is a
 signal something has drifted.
 
 Please add a test for anything touching the `Host` allow-list, HTML escaping, or

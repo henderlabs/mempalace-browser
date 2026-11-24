@@ -1,4 +1,4 @@
-# MemPalace Browser — changelog 
+# MemPalace Browser — changelog
 
 Previous release: 0.3.0.
 
@@ -7,7 +7,7 @@ Previous release: 0.3.0.
 ### Added
 - **Supersede chain.** Select a drawer and the map draws the chain of drawers that replaced it or that it replaced, with dates and a clickable list; the drawer's detail view shows the same chain. Links come from what the drawers themselves say ("supersedes the 2026-10-12 wrap") plus meaning and date, and are marked as inferred.
 - **Re-file planner.** A read-only audit view that suggests, with reasons and confidence, where drawers should be filed (neighbours by meaning, topic words, spelling, small rooms) and exports the plan as JSON for an agent. The browser never applies it.
-- **Update check and updater.** The browser tells you when a newer release exists (Updates row + info finding, no release yet today). It never installs anything: `update.sh`, run by you, verifies a published checksum, keeps a backup, restarts and rolls back on failure. New env: `MPB_RELEASES_URL`, `MPB_UPDATE_CHANNEL`; `MPB_CHECK_UPDATES=0` now turns off both the PyPI and the GitHub check.
+- **Update check and updater.** The browser tells you when a newer release exists (Updates row + info finding). It never installs anything: `update.sh`, run by you, verifies a published checksum, keeps a backup, restarts and rolls back on failure. New env: `MPB_RELEASES_URL`, `MPB_UPDATE_CHANNEL`; `MPB_CHECK_UPDATES=0` now turns off both the PyPI and the GitHub check.
 - **Staleness overlay.** Toolbar toggle that fades drawers not filed or rewritten lately, using the revision log (a wing move does not count as a rewrite). The tooltip shows how many times a drawer's text was rewritten.
 - **Cluster summary.** Hover a dot in a dense one-room pile to see how many drawers the room holds and the span of dates; press L to list the room by date. The map layout is unchanged.
 - **Possible conflicts.** Galaxy toolbar button listing very close drawer pairs that state the same kind of value (date, version, address, count, amount) differently, labelled "possible conflict — values differ"; dated snapshots set aside. Heuristic, never a verdict.
@@ -53,7 +53,7 @@ Previous release: 0.3.0.
 | `MPB_BACKUP_GLOBS` | *(unset)* | Comma-separated globs of your backups; enables the "Last backup" row and backup findings |
 | `MPB_SECRET_SCAN` | `1` | `0` turns the secret-text scan off |
 | `MPB_SECRET_ALLOW` | *(empty)* | Comma-separated drawer ids to stop flagging |
-| `MPB_RESOURCES` | `0` | (existing) host CPU and memory; enabled on the lab box |
+| `MPB_RESOURCES` | `0` | (existing) host CPU and memory; enable with `MPB_RESOURCES=1` |
 
 ### Compatibility
-- Built and verified on MemPalace 3.12.0 (2026-11-22). The integrity probe and the audit are importable package functions but not documented public APIs, so record the tested MemPalace range in the README and pin it in CI.
+- Built and verified on MemPalace 3.12.0 (2026-11-22). The integrity probe and the audit are importable package functions but not documented public APIs, so other MemPalace versions may differ. The README states the tested version.

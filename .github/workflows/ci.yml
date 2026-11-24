@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest no longer carries a Python 3.9 build, and 3.9 is the README's floor.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
